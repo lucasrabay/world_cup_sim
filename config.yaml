@@ -1,0 +1,23 @@
+data:
+  results_url: "https://raw.githubusercontent.com/martj42/international_results/master/results.csv"
+  shootouts_url: "https://raw.githubusercontent.com/martj42/international_results/master/shootouts.csv"
+  goalscorers_url: "https://raw.githubusercontent.com/martj42/international_results/master/goalscorers.csv"
+  elo_url: "http://api.clubelo.com/{team}"
+  min_year: 1994
+
+model:
+  n_trials_optuna: 50
+  cv_folds: 5
+  calibration_method: "isotonic"
+  time_decay_half_life_days: 365
+
+simulation:
+  n_simulations: 50000
+  random_seed: 42
+  penalty_conversion_rate: 0.734  # historical WC average
+
+tournament:
+  n_groups: 12
+  teams_per_group: 4
+  automatic_qualifiers_per_group: 2
+  best_third_places: 8
