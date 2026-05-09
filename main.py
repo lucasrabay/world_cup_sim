@@ -36,6 +36,7 @@ from src.data_loader import (
 from src.features import build_match_features, split_features_target
 from src.models import (
     DixonColesModel,
+    ELOLogisticModel,
     EnsemblePredictor,
     XGBMatchPredictor,
     evaluate_model,
@@ -135,10 +136,17 @@ def main() -> None:
         xgb = XGBMatchPredictor.load(xgb_path)
         print("     Loaded saved XGBoost predictor.")
     else:
-        # Train only on matches strictly before WC 2018 to keep WC 18/22 as held-out.
-        train_mask = feat_df["date"] < "2018-01-01"
+        # Hold out only WC 2018 + WC 2022 actual tournament matches; train on
+        # everything else — including post-2022 matches like Euro 2024 and the
+        # 2026 qualifiers. With the 180-day half-life pre-2018 data has tiny
+        # weight anyway, so the practical training window is mostly recent.
+        wc_holdout = (
+            (feat_df["date"] >= "2018-01-01")
+            & (feat_df["date"] <= "2023-01-01")
+            & (feat_df.get("is_wc", 0) == 1)
+        )
+        train_mask = ~wc_holdout
         X, y, w = split_features_target(feat_df.loc[train_mask])
-        # Trim optuna trial budget for snappier full pipelines (still configurable via config.yaml).
         xgb = XGBMatchPredictor()
         xgb.fit(X, y, sample_weight=w)
         xgb.save(xgb_path)
@@ -164,8 +172,26 @@ def main() -> None:
         print(f"     [warn] SHAP plot failed: {exc}")
 
     # 5. Ensemble ------------------------------------------------------------
-    print("\n[7/9] Building ensemble predictor …")
-    ensemble = EnsemblePredictor(dc, xgb, dc_weight=0.5)
+    print("\n[7/9] Building ensemble predictor (DC=0.30, XGB=0.55, ELO-logit=0.15) …")
+    elo_logit_path = MODELS_SAVED / "elo_logistic.joblib"
+    if args.skip_training and elo_logit_path.exists():
+        elo_logit = ELOLogisticModel.load(elo_logit_path)
+    else:
+        wc_holdout = (
+            (feat_df["date"] >= "2018-01-01")
+            & (feat_df["date"] <= "2023-01-01")
+            & (feat_df.get("is_wc", 0) == 1)
+        )
+        elo_logit = ELOLogisticModel().fit(feat_df.loc[~wc_holdout])
+        elo_logit.save(elo_logit_path)
+
+    ensemble = EnsemblePredictor(
+        dc,
+        xgb,
+        dc_weight=0.30,
+        elo_logistic=elo_logit,
+        elo_weight=0.15,
+    )
     ensemble.set_context(
         team_elo=_team_elo_snapshot(elo, teams_pool),
         team_value_eur_m=dict(zip(squad_values["team"], squad_values["value_eur_m"])),

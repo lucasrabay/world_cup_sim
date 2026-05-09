@@ -32,6 +32,7 @@ import pandas as pd
 from scipy.optimize import minimize
 from scipy.special import gammaln
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     brier_score_loss,
@@ -328,6 +329,25 @@ class XGBMatchPredictor:
         if sample_weight is None:
             sample_weight = pd.Series(np.ones(len(X)), index=X.index)
 
+        # Drop matches whose time-decay weight has effectively underflowed.
+        # With a 180-day half-life the oldest matches in our dataset weigh
+        # ~1e-19, which causes XGBoost's calibrator folds to fail the
+        # sum_weight >= 1e-6 sanity check. A 1e-4 floor is plenty since those
+        # samples contribute nothing to the gradient anyway.
+        WEIGHT_FLOOR = 1e-4
+        keep_mask = sample_weight.to_numpy(dtype=float) > WEIGHT_FLOOR
+        if not keep_mask.all():
+            dropped = int((~keep_mask).sum())
+            X = X.iloc[keep_mask].reset_index(drop=True)
+            y = y.iloc[keep_mask].reset_index(drop=True)
+            sample_weight = sample_weight.iloc[keep_mask].reset_index(drop=True)
+            logger.info("Dropped %d matches with weight < %.0e", dropped, WEIGHT_FLOOR)
+        # Normalise weights so their sum equals N — preserves relative
+        # weighting but keeps fold sums comfortably above XGBoost's epsilon.
+        sw_arr = sample_weight.to_numpy(dtype=float)
+        if sw_arr.sum() > 0:
+            sample_weight = pd.Series(sw_arr * len(sw_arr) / sw_arr.sum(), index=sample_weight.index)
+
         # Optuna search — keep verbose output minimal.
         try:
             import optuna
@@ -441,26 +461,105 @@ class XGBMatchPredictor:
 
 
 # ---------------------------------------------------------------------------
+# Lightweight ELO-only logistic regression
+# ---------------------------------------------------------------------------
+class ELOLogisticModel:
+    """Multinomial logistic regression on a single feature: ``elo_diff``.
+
+    Acts as a conservative regularising anchor inside the ensemble — it has no
+    capacity to overfit team-specific quirks the way XGBoost or DC can.
+    """
+
+    def __init__(self) -> None:
+        self.clf: LogisticRegression | None = None
+
+    def fit(self, feat_df: pd.DataFrame) -> "ELOLogisticModel":
+        if "elo_diff" not in feat_df.columns or "outcome" not in feat_df.columns:
+            raise ValueError("feat_df must contain 'elo_diff' and 'outcome' columns")
+        X = feat_df[["elo_diff"]].to_numpy(dtype=float)
+        y = feat_df["outcome"].astype(int).to_numpy()
+        w = (
+            feat_df["sample_weight"].to_numpy(dtype=float)
+            if "sample_weight" in feat_df.columns
+            else np.ones(len(feat_df))
+        )
+        self.clf = LogisticRegression(solver="lbfgs", max_iter=500)
+        self.clf.fit(X, y, sample_weight=w)
+        logger.info("ELO logistic anchor fitted on %d matches", len(feat_df))
+        return self
+
+    def predict_proba(self, elo_home: float, elo_away: float) -> dict[str, float]:
+        if self.clf is None:
+            return {"home_win": 0.34, "draw": 0.33, "away_win": 0.33}
+        x = np.array([[elo_home - elo_away]], dtype=float)
+        proba = self.clf.predict_proba(x)[0]
+        # sklearn gives ordered classes; classes_ tells us which.
+        cls = list(self.clf.classes_)
+        out = {0: 0.0, 1: 0.0, 2: 0.0}
+        for c, p in zip(cls, proba):
+            out[int(c)] = float(p)
+        return {"home_win": out[2], "draw": out[1], "away_win": out[0]}
+
+    def save(self, path: Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump({"clf": self.clf}, path)
+
+    @classmethod
+    def load(cls, path: Path) -> "ELOLogisticModel":
+        m = cls()
+        m.clf = joblib.load(path)["clf"]
+        return m
+
+
+# ---------------------------------------------------------------------------
 # Ensemble
 # ---------------------------------------------------------------------------
 class EnsemblePredictor:
-    """Convex combination of Dixon-Coles and XGBoost outcome probabilities.
+    """Three-way convex combination of Dixon-Coles, calibrated XGBoost, and a
+    simple ELO-only logistic regression.
 
     The XGBoost classifier needs a feature row, which is built lazily from the
     most recent ELO/value/xGD context held by this object — set those via
     ``set_context()`` once after training.
+
+    Default weights (DC=0.30, XGB=0.55, ELO=0.15) place the most trust in the
+    feature-rich classifier while keeping the scoreline-aware DC head and a
+    conservative ELO anchor in the mix. When ``elo_logistic`` is None the ELO
+    weight collapses into ``dc_weight`` so the binary-blend API still works.
     """
 
     def __init__(
         self,
         dc_model: DixonColesModel,
         xgb_model: XGBMatchPredictor,
-        dc_weight: float = 0.5,
+        dc_weight: float | None = None,
+        elo_logistic: "ELOLogisticModel | None" = None,
+        elo_weight: float | None = None,
     ) -> None:
         self.dc = dc_model
         self.xgb = xgb_model
-        self.dc_weight = float(np.clip(dc_weight, 0.0, 1.0))
-        self.xgb_weight = 1.0 - self.dc_weight
+        self.elo_logistic = elo_logistic
+
+        # Weight resolution. We always normalise the final triple, so callers
+        # can pass any non-negative numbers.
+        if dc_weight is None and elo_weight is None and elo_logistic is not None:
+            dc_weight, xgb_w, elo_weight = 0.30, 0.55, 0.15
+        else:
+            if dc_weight is None:
+                dc_weight = 0.5
+            if elo_logistic is None or elo_weight is None:
+                elo_weight = 0.0
+            xgb_w = max(0.0, 1.0 - float(dc_weight) - float(elo_weight))
+
+        total = float(dc_weight) + float(xgb_w) + float(elo_weight)
+        if total <= 0:
+            dc_weight, xgb_w, elo_weight = 0.5, 0.5, 0.0
+            total = 1.0
+        self.dc_weight = float(dc_weight) / total
+        self.xgb_weight = float(xgb_w) / total
+        self.elo_weight = float(elo_weight) / total
+
         self._team_elo: dict[str, float] = {}
         self._team_value: dict[str, float] = {}
 
@@ -470,11 +569,34 @@ class EnsemblePredictor:
 
     def _xgb_features_for(self, home_team: str, away_team: str, neutral: bool) -> pd.DataFrame:
         """Construct a single-row feature frame matching FEATURE_COLUMNS."""
+        from .features import (
+            DEFAULT_KO_RATE,
+            FIFA_RANKING_2026,
+            QUALIFYING_XGD,
+            TEAM_CONFEDERATION,
+            CONFEDERATION_DIFFICULTY,
+            WC_KNOCKOUT_WIN_RATE,
+            _value_tier,
+        )
+
         elo_h = self._team_elo.get(home_team, 1500.0)
         elo_a = self._team_elo.get(away_team, 1500.0)
-        v_h = float(np.log(self._team_value.get(home_team, 80.0)))
-        v_a = float(np.log(self._team_value.get(away_team, 80.0)))
-        from .features import QUALIFYING_XGD
+        val_h = self._team_value.get(home_team, 80.0)
+        val_a = self._team_value.get(away_team, 80.0)
+        v_h = float(np.log(val_h))
+        v_a = float(np.log(val_a))
+
+        rank_h = int(FIFA_RANKING_2026.get(home_team, 99))
+        rank_a = int(FIFA_RANKING_2026.get(away_team, 99))
+
+        ko_h = float(WC_KNOCKOUT_WIN_RATE.get(home_team, DEFAULT_KO_RATE))
+        ko_a = float(WC_KNOCKOUT_WIN_RATE.get(away_team, DEFAULT_KO_RATE))
+
+        # Confederation-discounted xGD
+        cm_h = float(CONFEDERATION_DIFFICULTY.get(TEAM_CONFEDERATION.get(home_team, ""), 1.0))
+        cm_a = float(CONFEDERATION_DIFFICULTY.get(TEAM_CONFEDERATION.get(away_team, ""), 1.0))
+        xg_h = float(QUALIFYING_XGD.get(home_team, 0.0)) * cm_h
+        xg_a = float(QUALIFYING_XGD.get(away_team, 0.0)) * cm_a
 
         row = {
             "elo_home": elo_h,
@@ -483,6 +605,8 @@ class EnsemblePredictor:
             "value_home": v_h,
             "value_away": v_a,
             "value_ratio": v_h - v_a,
+            "value_tier_home": _value_tier(val_h),
+            "value_tier_away": _value_tier(val_a),
             "is_neutral": int(bool(neutral)),
             "is_wc": 1,
             "tournament_weight": 1.0,
@@ -495,8 +619,15 @@ class EnsemblePredictor:
             "goals_conceded_10_home": 1.0,
             "goals_scored_10_away": 1.3,
             "goals_conceded_10_away": 1.0,
-            "xg_diff_qualifying_home": float(QUALIFYING_XGD.get(home_team, 0.0)),
-            "xg_diff_qualifying_away": float(QUALIFYING_XGD.get(away_team, 0.0)),
+            "xg_diff_qualifying_home": xg_h,
+            "xg_diff_qualifying_away": xg_a,
+            "fifa_rank_home": rank_h,
+            "fifa_rank_away": rank_a,
+            "rank_diff": float(rank_a - rank_h),
+            "log_rank_ratio": float(np.log((rank_a + 1) / (rank_h + 1))),
+            "wc_knockout_rate_home": ko_h,
+            "wc_knockout_rate_away": ko_a,
+            "wc_knockout_rate_diff": ko_h - ko_a,
         }
         return pd.DataFrame([row])[FEATURE_COLUMNS]
 
@@ -515,10 +646,30 @@ class EnsemblePredictor:
             logger.debug("XGB predict fallback (%s)", exc)
             xgb_pred = {"home_win": dc["home_win"], "draw": dc["draw"], "away_win": dc["away_win"]}
 
+        # ELO-logistic anchor (or fall back to DC if no logistic provided)
+        if self.elo_logistic is not None and self.elo_weight > 0:
+            elo_h = self._team_elo.get(home_team, 1500.0)
+            elo_a = self._team_elo.get(away_team, 1500.0)
+            elo_pred = self.elo_logistic.predict_proba(elo_h, elo_a)
+        else:
+            elo_pred = {"home_win": dc["home_win"], "draw": dc["draw"], "away_win": dc["away_win"]}
+
         blended = {
-            "home_win": self.dc_weight * dc["home_win"] + self.xgb_weight * xgb_pred["home_win"],
-            "draw": self.dc_weight * dc["draw"] + self.xgb_weight * xgb_pred["draw"],
-            "away_win": self.dc_weight * dc["away_win"] + self.xgb_weight * xgb_pred["away_win"],
+            "home_win": (
+                self.dc_weight * dc["home_win"]
+                + self.xgb_weight * xgb_pred["home_win"]
+                + self.elo_weight * elo_pred["home_win"]
+            ),
+            "draw": (
+                self.dc_weight * dc["draw"]
+                + self.xgb_weight * xgb_pred["draw"]
+                + self.elo_weight * elo_pred["draw"]
+            ),
+            "away_win": (
+                self.dc_weight * dc["away_win"]
+                + self.xgb_weight * xgb_pred["away_win"]
+                + self.elo_weight * elo_pred["away_win"]
+            ),
             "lambda_home": dc["lambda_home"],
             "lambda_away": dc["lambda_away"],
         }
@@ -632,6 +783,7 @@ def evaluate_model(
 __all__ = [
     "DixonColesModel",
     "XGBMatchPredictor",
+    "ELOLogisticModel",
     "EnsemblePredictor",
     "evaluate_model",
 ]

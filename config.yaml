@@ -9,7 +9,7 @@ model:
   n_trials_optuna: 50
   cv_folds: 5
   calibration_method: "isotonic"
-  time_decay_half_life_days: 365
+  time_decay_half_life_days: 180
 
 simulation:
   n_simulations: 50000

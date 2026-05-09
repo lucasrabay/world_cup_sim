@@ -278,8 +278,27 @@ def load_elo_ratings(teams: Iterable[str], results: pd.DataFrame | None = None) 
             ratings = _compute_elo_from_results(results)
 
     ratings = ratings.sort_values(["team", "date"]).reset_index(drop=True)
+    _warn_if_stale(ratings, list(teams))
     ratings.to_parquet(cache, index=False)
     return ratings
+
+
+def _warn_if_stale(ratings: pd.DataFrame, requested_teams: list[str], days: int = 60) -> None:
+    """Log a warning if the most recent ELO observation for any requested team
+    is older than ``days`` days. Stale ratings produce mis-calibrated lambdas."""
+    if ratings.empty:
+        logger.warning("ELO frame is empty — predictions will fall back to FALLBACK_ELO")
+        return
+    cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=days)
+    latest = ratings.groupby("team")["date"].max()
+    stale = latest[latest < cutoff]
+    missing = [t for t in requested_teams if t not in latest.index]
+    if len(stale) > 0:
+        sample = ", ".join(stale.index[:8].tolist()) + ("…" if len(stale) > 8 else "")
+        logger.warning("Stale ELO data (>%dd) for %d teams: %s", days, len(stale), sample)
+    if missing:
+        sample = ", ".join(missing[:8]) + ("…" if len(missing) > 8 else "")
+        logger.warning("No ELO history for %d requested teams: %s", len(missing), sample)
 
 
 def load_squad_values() -> pd.DataFrame:
