@@ -236,6 +236,82 @@ class DixonColesModel:
         l1, l2 = self.predict_lambda(home_team, away_team, neutral=neutral)
         return int(rng.poisson(l1)), int(rng.poisson(l2))
 
+    def sample_conditional(
+        self,
+        home_team: str,
+        away_team: str,
+        outcome: str,
+        neutral: bool = True,
+        max_goals: int = 10,
+        rng: np.random.Generator | None = None,
+    ) -> tuple[int, int]:
+        """Sample a scoreline from the τ-corrected Dixon-Coles grid conditioned
+        on a specified match outcome.
+
+        Parameters
+        ----------
+        home_team, away_team : team names known to the model.
+        outcome : one of 'H' (home win), 'D' (draw), 'A' (away win).
+        neutral : if True, drop the home-advantage term γ from λ_home.
+        max_goals : grid is built over (max_goals+1)² scoreline cells.
+        rng : numpy Generator. ``np.random`` is used if not supplied.
+
+        Returns
+        -------
+        (goals_home, goals_away) : non-negative integers consistent with
+            ``outcome`` (e.g. for 'H' we are guaranteed goals_home > goals_away).
+
+        Notes
+        -----
+        Cells outside the requested-outcome region are zeroed and the remainder
+        is renormalised before sampling. If the masked grid sums to zero (an
+        extreme λ pair could in theory produce that), we return a deterministic
+        minimum-margin scoreline matching the outcome and emit a warning.
+        """
+        if outcome not in ("H", "D", "A"):
+            raise ValueError(f"outcome must be 'H', 'D', or 'A', got {outcome!r}")
+        if rng is None:
+            rng = np.random.default_rng()
+
+        l1, l2 = self.predict_lambda(home_team, away_team, neutral=neutral)
+
+        # Build the τ-corrected joint scoreline distribution.
+        ks = np.arange(max_goals + 1)
+        log_ph = ks * np.log(l1) - l1 - gammaln(ks + 1)
+        log_pa = ks * np.log(l2) - l2 - gammaln(ks + 1)
+        joint = np.outer(np.exp(log_ph), np.exp(log_pa))
+        joint[0, 0] *= 1.0 - l1 * l2 * self.rho
+        joint[1, 0] *= 1.0 + l2 * self.rho
+        joint[0, 1] *= 1.0 + l1 * self.rho
+        joint[1, 1] *= 1.0 - self.rho
+        joint = np.clip(joint, 0.0, None)
+
+        i_idx, j_idx = np.indices(joint.shape)
+        if outcome == "H":
+            mask = i_idx > j_idx
+        elif outcome == "D":
+            mask = i_idx == j_idx
+        else:
+            mask = i_idx < j_idx
+
+        masked = joint * mask
+        total = masked.sum()
+        if total <= 0:
+            logger.warning(
+                "Conditional grid sum is zero for %s vs %s outcome=%s; using fallback",
+                home_team, away_team, outcome,
+            )
+            if outcome == "H":
+                return 1, 0
+            if outcome == "A":
+                return 0, 1
+            return 0, 0
+
+        flat = (masked / total).ravel()
+        idx = int(rng.choice(flat.size, p=flat))
+        gh, ga = divmod(idx, max_goals + 1)
+        return int(gh), int(ga)
+
     # ---------------- Persistence ----------------
     def save(self, path: Path) -> None:
         path = Path(path)
@@ -294,6 +370,8 @@ class XGBMatchPredictor:
             "eval_metric": "mlogloss",
             "tree_method": "hist",
             "verbosity": 0,
+            "random_state": 42,
+            "n_jobs": 1,
             "max_depth": trial.suggest_int("max_depth", 3, 10),
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
             "n_estimators": trial.suggest_int("n_estimators", 100, 1000),
@@ -348,12 +426,18 @@ class XGBMatchPredictor:
         if sw_arr.sum() > 0:
             sample_weight = pd.Series(sw_arr * len(sw_arr) / sw_arr.sum(), index=sample_weight.index)
 
-        # Optuna search — keep verbose output minimal.
+        # Optuna search — seeded for full determinism so downstream evaluation
+        # and Monte Carlo simulations produce the same results across runs.
         try:
             import optuna
 
             optuna.logging.set_verbosity(optuna.logging.WARNING)
-            study = optuna.create_study(direction="minimize", study_name="xgb_match")
+            sampler = optuna.samplers.TPESampler(seed=42)
+            study = optuna.create_study(
+                direction="minimize",
+                study_name="xgb_match",
+                sampler=sampler,
+            )
             study.optimize(
                 lambda trial: self._objective(trial, X, y, sample_weight),
                 n_trials=self.n_trials,
@@ -378,6 +462,8 @@ class XGBMatchPredictor:
             eval_metric="mlogloss",
             tree_method="hist",
             verbosity=0,
+            random_state=42,
+            n_jobs=1,
             **self.best_params,
         )
         base.fit(X, y, sample_weight=sample_weight)
@@ -391,6 +477,8 @@ class XGBMatchPredictor:
                 eval_metric="mlogloss",
                 tree_method="hist",
                 verbosity=0,
+                random_state=42,
+                n_jobs=1,
                 **self.best_params,
             ),
             method=self.calibration_method,

@@ -13,6 +13,7 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
+from scipy.special import gammaln
 
 from .data_loader import HOST_NATIONS
 from .models import EnsemblePredictor
@@ -39,6 +40,15 @@ EXIT_TO_PROB_COL = {
     "f": "p_final",
     "champion": "p_champion",
 }
+
+
+def _cdf_or_none(flat: np.ndarray | None) -> np.ndarray | None:
+    """Cumulative distribution helper that tolerates ``None`` input."""
+    if flat is None:
+        return None
+    cdf = np.cumsum(flat)
+    cdf[-1] = 1.0
+    return cdf
 
 
 # ---------------------------------------------------------------------------
@@ -93,14 +103,59 @@ class WorldCupSimulator:
         self.teams = sorted({t for ts in self.groups.values() for t in ts})
         self._rng = np.random.default_rng(self.seed)
 
-        # Cache λ for every directed pair (home, away) under the assumption
-        # WC matches are neutral. This is the only time we ever call the
-        # underlying predictor — sampling scorelines is then pure NumPy.
+        # Per-fixture cache: (a, b, scenario_id) ->
+        #   (p_h, p_d, p_a, λ_h, λ_a, [flat_grid_H, flat_grid_D, flat_grid_A])
+        # Grids are pre-built once per fixture so every sim of that fixture
+        # reuses them — no team lookup or τ-correction inside the inner loop.
+        self._fixture_cache: dict[tuple[str, str, str], dict] = {}
+        # Lightweight backwards-compat λ cache (some external callers expect it).
         self._lambda_cache: dict[tuple[str, str], tuple[float, float]] = {}
 
     # ------------------------------------------------------------------ utils
+    @staticmethod
+    def _scenario_key(scenario: dict | None) -> str:
+        """Stable hashable identifier for a scenario dict."""
+        if not scenario:
+            return "_baseline_"
+        return scenario.get("name", repr(sorted(scenario.items()))) or "_baseline_"
+
+    @staticmethod
+    def _build_dc_grid(l_h: float, l_a: float, rho: float, max_goals: int = 10) -> np.ndarray:
+        """Construct the (max_goals+1)² τ-corrected joint scoreline grid."""
+        ks = np.arange(max_goals + 1)
+        log_ph = ks * np.log(l_h) - l_h - gammaln(ks + 1)
+        log_pa = ks * np.log(l_a) - l_a - gammaln(ks + 1)
+        joint = np.outer(np.exp(log_ph), np.exp(log_pa))
+        joint[0, 0] *= 1.0 - l_h * l_a * rho
+        joint[1, 0] *= 1.0 + l_a * rho
+        joint[0, 1] *= 1.0 + l_h * rho
+        joint[1, 1] *= 1.0 - rho
+        joint = np.clip(joint, 0.0, None)
+        s = joint.sum()
+        if s > 0:
+            joint = joint / s
+        return joint
+
+    @staticmethod
+    def _conditional_flat_grids(joint: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+        """Return three flattened, per-outcome-renormalised distributions.
+
+        Order: (home_win_grid, draw_grid, away_win_grid). Any of them may be
+        ``None`` if the masked sum is zero.
+        """
+        i_idx, j_idx = np.indices(joint.shape)
+        out: list[np.ndarray | None] = []
+        for mask in (i_idx > j_idx, i_idx == j_idx, i_idx < j_idx):
+            masked = joint * mask
+            total = masked.sum()
+            if total <= 0:
+                out.append(None)
+            else:
+                out.append((masked / total).ravel())
+        return out[0], out[1], out[2]
+
     def _lambda(self, a: str, b: str, scenario: dict | None = None) -> tuple[float, float]:
-        """λ for (a,b). Scenario overrides applied last (multiplicative)."""
+        """Backwards-compat: just the λ pair (with scenario applied + clipped)."""
         key = (a, b)
         if key in self._lambda_cache:
             la, lb = self._lambda_cache[key]
@@ -110,11 +165,162 @@ class WorldCupSimulator:
             except Exception:
                 la, lb = 1.2, 1.2
             self._lambda_cache[key] = (la, lb)
-
         if scenario:
             la *= scenario.get("lambda_mult", {}).get(a, 1.0)
             lb *= scenario.get("lambda_mult", {}).get(b, 1.0)
         return float(np.clip(la, 0.05, 6.0)), float(np.clip(lb, 0.05, 6.0))
+
+    def _prebuild_baseline_cache(self) -> None:
+        """Populate the baseline fixture cache for every (home, away) pair in
+        a single batched XGB prediction call.
+
+        Without this pre-pass each unique fixture triggers an individual
+        ``predict_proba`` call (~10-15ms of sklearn/XGBoost overhead), and the
+        tournament touches ~2200 unique pairs across 50k sims — driving the
+        baseline run from ~25s to ~55s. Batching turns that into one ~80ms
+        call plus pure NumPy.
+        """
+        if any(k for k in self._fixture_cache if k[2] == "_baseline_"):
+            return
+        teams = self.teams
+        rho = float(self.predictor.dc.rho)
+        rows: list[pd.DataFrame] = []
+        pairs: list[tuple[str, str]] = []
+        for h in teams:
+            for a in teams:
+                if h == a:
+                    continue
+                rows.append(self.predictor._xgb_features_for(h, a, neutral=True))
+                pairs.append((h, a))
+        if not rows:
+            return
+        X_all = pd.concat(rows, ignore_index=True)
+        try:
+            proba = self.predictor.xgb.predict_proba(X_all)  # (N, 3) -> [loss, draw, win]
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            logger.warning("Batched XGB predict failed (%s) — falling back to per-fixture path", exc)
+            return
+
+        dw = float(self.predictor.dc_weight)
+        xw = float(self.predictor.xgb_weight)
+        ew = float(self.predictor.elo_weight)
+        team_elo = getattr(self.predictor, "_team_elo", {})
+        elo_logit = getattr(self.predictor, "elo_logistic", None)
+
+        for i, (h, a) in enumerate(pairs):
+            l_h, l_a = self.predictor.dc.predict_lambda(h, a, neutral=True)
+            l_h = float(np.clip(l_h, 0.05, 6.0))
+            l_a = float(np.clip(l_a, 0.05, 6.0))
+            dc_probs = self.predictor.dc.predict_outcome_probs(h, a, neutral=True)
+            xgb_h, xgb_d, xgb_a = float(proba[i, 2]), float(proba[i, 1]), float(proba[i, 0])
+            if elo_logit is not None and ew > 0:
+                elo_probs = elo_logit.predict_proba(
+                    float(team_elo.get(h, 1500.0)),
+                    float(team_elo.get(a, 1500.0)),
+                )
+            else:
+                elo_probs = {"home_win": dc_probs["home_win"],
+                              "draw": dc_probs["draw"],
+                              "away_win": dc_probs["away_win"]}
+
+            p_h = dw * dc_probs["home_win"] + xw * xgb_h + ew * elo_probs["home_win"]
+            p_d = dw * dc_probs["draw"]      + xw * xgb_d + ew * elo_probs["draw"]
+            p_a = dw * dc_probs["away_win"] + xw * xgb_a + ew * elo_probs["away_win"]
+            s = p_h + p_d + p_a
+            if s > 0:
+                p_h, p_d, p_a = p_h / s, p_d / s, p_a / s
+
+            joint = self._build_dc_grid(l_h, l_a, rho)
+            flat_h, flat_d, flat_a = self._conditional_flat_grids(joint)
+
+            # Pre-build ET grid + CDFs too — saves another N rebuilds.
+            et_l_h = float(np.clip(l_h * 0.33, 0.05, 4.0))
+            et_l_a = float(np.clip(l_a * 0.33, 0.05, 4.0))
+            et_joint = self._build_dc_grid(et_l_h, et_l_a, rho=0.0)
+            i_idx, j_idx = np.indices(et_joint.shape)
+            et_p_h = float(et_joint[i_idx > j_idx].sum())
+            et_p_d = float(np.diag(et_joint).sum())
+            et_p_a = float(et_joint[i_idx < j_idx].sum())
+            et_flat_h, et_flat_d, et_flat_a = self._conditional_flat_grids(et_joint)
+
+            self._fixture_cache[(h, a, "_baseline_")] = {
+                "p_h": p_h, "p_d": p_d, "p_a": p_a,
+                "l_h": l_h, "l_a": l_a, "rho": rho,
+                "flat_h": flat_h, "flat_d": flat_d, "flat_a": flat_a,
+                "cdf_h": _cdf_or_none(flat_h),
+                "cdf_d": _cdf_or_none(flat_d),
+                "cdf_a": _cdf_or_none(flat_a),
+                "max_goals": joint.shape[0] - 1,
+                "et_p_h": et_p_h, "et_p_d": et_p_d, "et_p_a": et_p_a,
+                "et_cdf_h": _cdf_or_none(et_flat_h),
+                "et_cdf_d": _cdf_or_none(et_flat_d),
+                "et_cdf_a": _cdf_or_none(et_flat_a),
+                "et_max_goals": et_joint.shape[0] - 1,
+            }
+
+    def _fixture_data(self, a: str, b: str, scenario: dict | None) -> dict:
+        """Return cached fixture metadata: outcome probs, λs, and conditional grids.
+
+        For the baseline (no scenario) we use the calibrated ensemble's outcome
+        probabilities directly. Under a scenario with ``lambda_mult`` overrides
+        we re-derive outcomes from the τ-corrected DC grid at the adjusted λs
+        — this is the only way an injury / form scenario can move outcomes,
+        since the ensemble's XGB head doesn't see scenario flags.
+        """
+        key = (a, b, self._scenario_key(scenario))
+        cached = self._fixture_cache.get(key)
+        if cached is not None:
+            return cached
+
+        rho = float(self.predictor.dc.rho)
+
+        # Compute scenario-adjusted λs once.
+        l_h, l_a = self._lambda(a, b, scenario=scenario)
+
+        if scenario is None:
+            try:
+                pred = self.predictor.predict(a, b, neutral=True)
+                p_h = float(pred["home_win"])
+                p_d = float(pred["draw"])
+                p_a = float(pred["away_win"])
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Ensemble predict fallback (%s)", exc)
+                joint = self._build_dc_grid(l_h, l_a, rho)
+                i_idx, j_idx = np.indices(joint.shape)
+                p_h = float(joint[i_idx > j_idx].sum())
+                p_d = float(np.diag(joint).sum())
+                p_a = float(joint[i_idx < j_idx].sum())
+        else:
+            # Scenario path: derive outcome probs from DC at adjusted λs so
+            # that lambda_mult actually moves the outcome distribution.
+            joint = self._build_dc_grid(l_h, l_a, rho)
+            i_idx, j_idx = np.indices(joint.shape)
+            p_h = float(joint[i_idx > j_idx].sum())
+            p_d = float(np.diag(joint).sum())
+            p_a = float(joint[i_idx < j_idx].sum())
+
+        # Always build scoreline grids from the (possibly adjusted) λs.
+        joint = self._build_dc_grid(l_h, l_a, rho)
+        flat_h, flat_d, flat_a = self._conditional_flat_grids(joint)
+
+        # CDFs for fast searchsorted-based vectorised sampling.
+        def _cdf(flat: np.ndarray | None) -> np.ndarray | None:
+            if flat is None:
+                return None
+            cdf = np.cumsum(flat)
+            cdf[-1] = 1.0  # guard against floating-point shortfall
+            return cdf
+
+        data = {
+            "p_h": p_h, "p_d": p_d, "p_a": p_a,
+            "l_h": l_h, "l_a": l_a,
+            "rho": rho,
+            "flat_h": flat_h, "flat_d": flat_d, "flat_a": flat_a,
+            "cdf_h": _cdf(flat_h), "cdf_d": _cdf(flat_d), "cdf_a": _cdf(flat_a),
+            "max_goals": joint.shape[0] - 1,
+        }
+        self._fixture_cache[key] = data
+        return data
 
     def _sample_scorelines(
         self,
@@ -124,33 +330,114 @@ class WorldCupSimulator:
         scenario: dict | None = None,
         knockout: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Sample ``n`` scorelines for the fixture. Vectorised."""
-        la, lb = self._lambda(team_a, team_b, scenario=scenario)
-        ga = self._rng.poisson(la, size=n).astype(np.int32)
-        gb = self._rng.poisson(lb, size=n).astype(np.int32)
+        """Sample ``n`` scorelines for the fixture (ensemble-driven outcomes).
+
+        For each of ``n`` simulations:
+            1. Sample an outcome ∈ {H, D, A} from the ensemble's calibrated
+               probabilities (or from DC's adjusted-λ grid under a scenario).
+            2. Sample a scoreline from the DC grid masked to that outcome.
+
+        For knockout matches drawn outcomes are then resolved with extra time
+        (λ * 0.33, no τ) and a λ-biased Bernoulli shootout when ET also draws.
+        """
+        f = self._fixture_data(team_a, team_b, scenario)
+        outcomes = self._sample_outcomes(f["p_h"], f["p_d"], f["p_a"], n)
+        ga, gb = self._scoreline_from_outcomes(outcomes, f, n)
+
         if not knockout:
             return ga, gb
 
-        # Knockout: tied games -> 30min ET (rate * 0.33), then penalties.
-        tied = ga == gb
-        if tied.any():
-            n_tied = int(tied.sum())
-            ga_et = self._rng.poisson(la * 0.33, size=n_tied).astype(np.int32)
-            gb_et = self._rng.poisson(lb * 0.33, size=n_tied).astype(np.int32)
-            ga[tied] = ga[tied] + ga_et
-            gb[tied] = gb[tied] + gb_et
-            still_tied = ga == gb
-            if still_tied.any():
-                # Sudden-death-style modelled as a single Bernoulli with
-                # P(team_a wins) given each side independently converts at
-                # config rate. P(A wins shootout) ≈ 0.5 by symmetry — but we
-                # bias slightly by relative attack λ.
-                bias = 0.5 + 0.05 * np.tanh((la - lb) / max(la + lb, 1e-6))
-                wins_a = self._rng.random(int(still_tied.sum())) < bias
-                # Encode pen result by adding a single-goal margin.
-                idx = np.where(still_tied)[0]
-                ga[idx[wins_a]] += 1
-                gb[idx[~wins_a]] += 1
+        tied_mask = outcomes == 1
+        n_tied = int(tied_mask.sum())
+        if n_tied == 0:
+            return ga, gb
+
+        # Extra time: reuse pre-cached ET grid if available (baseline path),
+        # otherwise build it on the fly (scenario path).
+        if "et_cdf_h" in f:
+            et_p_h = float(f["et_p_h"])
+            et_p_d = float(f["et_p_d"])
+            et_p_a = float(f["et_p_a"])
+            et_data = {
+                "cdf_h": f["et_cdf_h"], "cdf_d": f["et_cdf_d"], "cdf_a": f["et_cdf_a"],
+                "max_goals": int(f["et_max_goals"]),
+            }
+        else:
+            et_l_h = float(np.clip(f["l_h"] * 0.33, 0.05, 4.0))
+            et_l_a = float(np.clip(f["l_a"] * 0.33, 0.05, 4.0))
+            et_joint = self._build_dc_grid(et_l_h, et_l_a, rho=0.0)
+            i_idx, j_idx = np.indices(et_joint.shape)
+            et_p_h = float(et_joint[i_idx > j_idx].sum())
+            et_p_d = float(np.diag(et_joint).sum())
+            et_p_a = float(et_joint[i_idx < j_idx].sum())
+            et_flat_h, et_flat_d, et_flat_a = self._conditional_flat_grids(et_joint)
+            et_data = {
+                "cdf_h": _cdf_or_none(et_flat_h),
+                "cdf_d": _cdf_or_none(et_flat_d),
+                "cdf_a": _cdf_or_none(et_flat_a),
+                "max_goals": et_joint.shape[0] - 1,
+            }
+
+        et_outcomes = self._sample_outcomes(et_p_h, et_p_d, et_p_a, n_tied)
+        et_ga, et_gb = self._scoreline_from_outcomes(et_outcomes, et_data, n_tied)
+
+        tied_idx = np.where(tied_mask)[0]
+        ga[tied_idx] += et_ga
+        gb[tied_idx] += et_gb
+
+        # Penalty shootout for matches still tied after ET.
+        st_local = et_outcomes == 1
+        if st_local.any():
+            n_st = int(st_local.sum())
+            bias = 0.5 + 0.05 * np.tanh((f["l_h"] - f["l_a"]) / max(f["l_h"] + f["l_a"], 1e-6))
+            wins_a = self._rng.random(n_st) < bias
+            st_idx = tied_idx[st_local]
+            ga[st_idx[wins_a]] += 1
+            gb[st_idx[~wins_a]] += 1
+        return ga, gb
+
+    def _sample_outcomes(self, p_h: float, p_d: float, p_a: float, n: int) -> np.ndarray:
+        """Sample n outcomes from a categorical (0=H, 1=D, 2=A)."""
+        s = p_h + p_d + p_a
+        if s <= 0:
+            p_h, p_d, p_a = 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0
+            s = 1.0
+        u = self._rng.random(n)
+        c1 = p_h / s
+        c2 = (p_h + p_d) / s
+        return np.where(u < c1, 0, np.where(u < c2, 1, 2)).astype(np.int8)
+
+    def _scoreline_from_outcomes(
+        self,
+        outcomes: np.ndarray,
+        f: dict,
+        n: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Vectorised conditional scoreline draw given an outcome array."""
+        max_goals = int(f["max_goals"])
+        ga = np.zeros(n, dtype=np.int32)
+        gb = np.zeros(n, dtype=np.int32)
+        # Per-outcome searchsorted into the conditional CDF — much faster than
+        # np.random.choice with p= for large n.
+        for code, cdf_key, fallback in (
+            (0, "cdf_h", (1, 0)),
+            (1, "cdf_d", (0, 0)),
+            (2, "cdf_a", (0, 1)),
+        ):
+            sel = outcomes == code
+            n_sel = int(sel.sum())
+            if n_sel == 0:
+                continue
+            cdf = f.get(cdf_key)
+            if cdf is None:
+                ga[sel] = fallback[0]
+                gb[sel] = fallback[1]
+                continue
+            u = self._rng.random(n_sel)
+            idx = np.searchsorted(cdf, u, side="right")
+            np.clip(idx, 0, cdf.size - 1, out=idx)
+            ga[sel] = (idx // (max_goals + 1)).astype(np.int32)
+            gb[sel] = (idx % (max_goals + 1)).astype(np.int32)
         return ga, gb
 
     # ------------------------------------------------------------------ pens
@@ -167,22 +454,128 @@ class WorldCupSimulator:
         return team_a if a > b else team_b
 
     # ------------------------------------------------------------------ single-match (sequential)
+    @staticmethod
+    def _sample_poisson_conditional(
+        l_h: float,
+        l_a: float,
+        outcome: str,
+        rho: float = 0.0,
+        max_goals: int = 10,
+        rng: np.random.Generator | None = None,
+    ) -> tuple[int, int]:
+        """Sample (gh, ga) from a τ-corrected DC grid built from raw λ inputs.
+
+        Used for extra-time re-sampling, where we have λs in hand and want a
+        scoreline conditional on a given outcome without doing any team lookup.
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+        if outcome not in ("H", "D", "A"):
+            raise ValueError(f"outcome must be 'H', 'D', or 'A', got {outcome!r}")
+        joint = WorldCupSimulator._build_dc_grid(l_h, l_a, rho, max_goals=max_goals)
+        i_idx, j_idx = np.indices(joint.shape)
+        if outcome == "H":
+            mask = i_idx > j_idx
+        elif outcome == "D":
+            mask = i_idx == j_idx
+        else:
+            mask = i_idx < j_idx
+        masked = joint * mask
+        total = masked.sum()
+        if total <= 0:
+            if outcome == "H":
+                return 1, 0
+            if outcome == "A":
+                return 0, 1
+            return 0, 0
+        flat = (masked / total).ravel()
+        idx = int(rng.choice(flat.size, p=flat))
+        gh, ga = divmod(idx, max_goals + 1)
+        return int(gh), int(ga)
+
     def simulate_match(self, home_team: str, away_team: str, knockout: bool = False) -> dict:
-        ga, gb = self._sample_scorelines(home_team, away_team, n=1, knockout=knockout)
-        ga_i, gb_i = int(ga[0]), int(gb[0])
-        if ga_i == gb_i:
-            winner = None
-            went_to_pens = False
-            if knockout:
+        """Simulate a single match: outcome from ensemble, scoreline from DC.
+
+        For knockout matches a draw triggers extra time (λ * 0.33, no τ);
+        if ET is also drawn we run a penalty shootout. The returned scoreline
+        reflects 90-minute + ET goals; shootout results are encoded only in
+        ``winner`` and ``went_to_pens``.
+        """
+        pred = self.predictor.predict(home_team, away_team, neutral=True)
+        p_h = float(pred["home_win"])
+        p_d = float(pred["draw"])
+        p_a = float(pred["away_win"])
+        l_h = float(pred["lambda_home"])
+        l_a = float(pred["lambda_away"])
+
+        # Step 1 — sample the outcome from the ensemble's calibrated probs.
+        u = float(self._rng.random())
+        s = max(p_h + p_d + p_a, 1e-12)
+        if u < p_h / s:
+            outcome = "H"
+        elif u < (p_h + p_d) / s:
+            outcome = "D"
+        else:
+            outcome = "A"
+
+        # Step 2 — scoreline conditional on the sampled outcome.
+        gh, ga = self.predictor.dc.sample_conditional(
+            home_team, away_team, outcome, neutral=True, rng=self._rng
+        )
+
+        went_to_pens = False
+        winner: str | None
+
+        # Step 3 — knockout draw resolution.
+        if knockout and outcome == "D":
+            et_l_h = float(np.clip(l_h * 0.33, 0.05, 4.0))
+            et_l_a = float(np.clip(l_a * 0.33, 0.05, 4.0))
+
+            # Sample ET outcome from its λ-derived grid (no τ for the 30-min period).
+            et_joint = self._build_dc_grid(et_l_h, et_l_a, rho=0.0)
+            i_idx, j_idx = np.indices(et_joint.shape)
+            ep_h = float(et_joint[i_idx > j_idx].sum())
+            ep_d = float(np.diag(et_joint).sum())
+            ep_a = float(et_joint[i_idx < j_idx].sum())
+            u2 = float(self._rng.random())
+            es = max(ep_h + ep_d + ep_a, 1e-12)
+            if u2 < ep_h / es:
+                et_outcome = "H"
+            elif u2 < (ep_h + ep_d) / es:
+                et_outcome = "D"
+            else:
+                et_outcome = "A"
+
+            et_gh, et_ga = self._sample_poisson_conditional(
+                et_l_h, et_l_a, et_outcome, rho=0.0, rng=self._rng
+            )
+            gh += et_gh
+            ga += et_ga
+            outcome = et_outcome  # promote ET result
+
+            if et_outcome == "D":
                 winner = self.simulate_penalty_shootout(home_team, away_team)
                 went_to_pens = True
+                return {
+                    "home": home_team, "away": away_team,
+                    "goals_home": int(gh), "goals_away": int(ga),
+                    "winner": winner, "went_to_pens": True,
+                    "outcome_sampled": "D",
+                }
+
+        # Step 4 — winner from the (possibly post-ET) scoreline.
+        if gh > ga:
+            winner = home_team
+        elif gh < ga:
+            winner = away_team
         else:
-            winner = home_team if ga_i > gb_i else away_team
-            went_to_pens = False
+            winner = None  # group-stage draw (only reachable with knockout=False)
+
         return {
             "home": home_team, "away": away_team,
-            "goals_home": ga_i, "goals_away": gb_i,
+            "goals_home": int(gh), "goals_away": int(ga),
             "winner": winner, "went_to_pens": went_to_pens,
+            "outcome_sampled": outcome,
         }
 
     # ------------------------------------------------------------------ group stage (vectorised)
@@ -345,19 +738,25 @@ class WorldCupSimulator:
             + (l_gd.astype(np.int64) + OFFSET) * OFFSET
             + (l_gf.astype(np.int64) + OFFSET)
         )
-        # Stable rank within sim (descending).
+        # Stable rank within sim (descending) — pure NumPy.
         order = np.argsort(-prim, axis=1, kind="stable")
         ranks = np.empty_like(order)
-        for s in range(n):
-            for r, k in enumerate(order[s]):
-                ranks[s, k] = r
+        np.put_along_axis(
+            ranks,
+            order,
+            np.broadcast_to(np.arange(prim.shape[1]), prim.shape),
+            axis=1,
+        )
 
-        # Resolve teams sharing primary key via H2H. We do this only where ties
-        # actually exist — overwhelmingly the common case is no further work.
-        # Strategy: detect groups of teams with identical prim within a sim,
-        # apply h2h composite, and renumber.
-        for s in range(n):
-            # find groups of equal prim values
+        # Short-circuit: identify which sims actually contain any tied primary
+        # keys. Sims without ties (typically ~60-80% of all sims) need no
+        # further work, saving us the np.unique() call per sim.
+        sorted_prim = np.sort(prim, axis=1)
+        has_tie = np.any(sorted_prim[:, 1:] == sorted_prim[:, :-1], axis=1)
+        tied_sims = np.flatnonzero(has_tie)
+
+        # Resolve teams sharing primary key via H2H — only for sims that need it.
+        for s in tied_sims:
             uniq, inv, counts = np.unique(prim[s], return_inverse=True, return_counts=True)
             for u_idx, c in enumerate(counts):
                 if c < 2:
@@ -463,43 +862,51 @@ class WorldCupSimulator:
         round_label: str,
         scenario: dict | None,
     ) -> list[np.ndarray]:
-        """Play one KO round across all sims; return list of winner index arrays."""
+        """Play one KO round across all sims; return list of winner index arrays.
+
+        Sims sharing the same (home, away) team pair are batched together —
+        we group by sort-and-slice on the composite key, which is faster than
+        building a fresh ``mask = inv == k`` boolean array per unique pair
+        when each group covers only a few of the 50k sims.
+        """
         winners: list[np.ndarray] = []
+        T = len(self.teams)
         team_names = self.teams
+        rank = self.ROUND_RANK[round_label]
+
         for left, right in pairings:
-            # Teams may differ per sim; build composite-sample by grouping
-            # identical fixtures and batching their Poisson sampling.
             wins = np.empty_like(left)
-            # Build a hashmap: (a, b) -> indices
-            keys = left.astype(np.int64) * len(team_names) + right.astype(np.int64)
-            uniq_keys, inv = np.unique(keys, return_inverse=True)
-            for k_i, k in enumerate(uniq_keys):
-                mask = inv == k_i
-                a_idx = int(k // len(team_names))
-                b_idx = int(k - a_idx * len(team_names))
+            keys = left.astype(np.int64) * T + right.astype(np.int64)
+
+            # Stable sort groups sims by (a, b); split points found by np.diff.
+            sort_idx = np.argsort(keys, kind="stable")
+            sorted_keys = keys[sort_idx]
+            change = np.concatenate(([True], sorted_keys[1:] != sorted_keys[:-1]))
+            starts = np.flatnonzero(change)
+            ends = np.concatenate((starts[1:], [len(keys)]))
+
+            for u_start, u_end in zip(starts, ends):
+                k = int(sorted_keys[u_start])
+                indices = sort_idx[u_start:u_end]
+                a_idx = k // T
+                b_idx = k - a_idx * T
                 a, b = team_names[a_idx], team_names[b_idx]
-                count = int(mask.sum())
+                count = int(u_end - u_start)
                 ga, gb = self._sample_scorelines(a, b, n=count, scenario=scenario, knockout=True)
-                a_wins = ga >= gb  # ties impossible after KO sampler
-                # pick winner indices
+                a_wins = ga >= gb  # ties impossible after the KO sampler
                 w_idx = np.where(a_wins, a_idx, b_idx)
                 l_idx = np.where(a_wins, b_idx, a_idx)
-                wins[mask] = w_idx
-                # Update goals/matches
-                ctx.goals_for[mask, a_idx] += ga
-                ctx.goals_against[mask, a_idx] += gb
-                ctx.goals_for[mask, b_idx] += gb
-                ctx.goals_against[mask, b_idx] += ga
-                ctx.matches[mask, a_idx] += 1
-                ctx.matches[mask, b_idx] += 1
-
-                # Record exit round for losers (winner exit round updated later if they lose)
-                rank = self.ROUND_RANK[round_label]
-                # Mark loser exit at this round (they go out HERE)
-                loser_global = np.where(a_wins, b_idx, a_idx)
-                # set exit_round[mask, loser] = max(prev, rank)
-                # prev should generally be = rank-1 already (group exit is 1)
-                ctx.exit_round[np.where(mask)[0], loser_global] = rank
+                wins[indices] = w_idx
+                # Per-team accumulator updates use fancy indexing on the
+                # short ``indices`` array (typically a handful of entries)
+                # rather than a 50k-length boolean mask.
+                ctx.goals_for[indices, a_idx] += ga
+                ctx.goals_against[indices, a_idx] += gb
+                ctx.goals_for[indices, b_idx] += gb
+                ctx.goals_against[indices, b_idx] += ga
+                ctx.matches[indices, a_idx] += 1
+                ctx.matches[indices, b_idx] += 1
+                ctx.exit_round[indices, l_idx] = rank
             winners.append(wins)
         return winners
 
@@ -536,6 +943,15 @@ class WorldCupSimulator:
         """Run the full simulation and return the per-team summary frame."""
         # reset RNG so that independent .run() calls with same seed are deterministic
         self._rng = np.random.default_rng(self.seed)
+        # Drop any per-fixture cache state from a previous scenario; otherwise
+        # a baseline run could re-use grids built under, say, "haaland_injured".
+        self._fixture_cache = {}
+        self._lambda_cache = {}
+        # Batched ensemble pre-prediction — one XGB call for every pair so the
+        # inner loop is pure NumPy. Only worthwhile for baseline; scenarios
+        # use DC-derived probs and need re-keyed cache entries anyway.
+        if scenario is None:
+            self._prebuild_baseline_cache()
         ctx = SimContext(teams=list(self.teams), n_sims=self.n_sims)
         placements_idx, group_letters, group_metrics = self.simulate_group_stage(scenario=scenario, ctx=ctx)
 

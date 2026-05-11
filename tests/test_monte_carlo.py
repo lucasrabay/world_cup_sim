@@ -7,9 +7,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.data_loader import WC2026_GROUPS
-from src.features import build_match_features
-from src.models import DixonColesModel, EnsemblePredictor, XGBMatchPredictor
+from src.data_loader import FALLBACK_ELO, SQUAD_VALUES, WC2026_GROUPS
+from src.features import build_match_features, split_features_target
+from src.models import (
+    DixonColesModel,
+    ELOLogisticModel,
+    EnsemblePredictor,
+    XGBMatchPredictor,
+)
 from src.monte_carlo import WorldCupSimulator
 
 
@@ -98,3 +103,138 @@ def test_group_standings_deterministic(trained_predictor):
     pb, _, _ = sim_b.simulate_group_stage(scenario=None, ctx=None)
     for g in pa:
         assert np.array_equal(pa[g], pb[g]), f"Group {g} placements differ between identical seeds"
+
+
+# ---------------------------------------------------------------------------
+# Strength-biased fixture used by the conditional-sampling tests below.
+# The existing ``trained_predictor`` randomises scores independent of team
+# identity, so it cannot produce e.g. Spain ≫ Jordan. This fixture biases
+# goal scoring by FALLBACK_ELO so the trained model learns realistic
+# attack/defence parameters.
+# ---------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def realistic_predictor():
+    """Train a small ensemble on synthetic data biased by FALLBACK_ELO."""
+    teams = sorted({t for ts in WC2026_GROUPS.values() for t in ts})
+    rng = np.random.default_rng(7)
+    base = pd.Timestamp("2024-01-01")
+    rows = []
+    for i in range(4500):
+        h, a = rng.choice(teams, size=2, replace=False)
+        elo_h = float(FALLBACK_ELO.get(h, 1500.0))
+        elo_a = float(FALLBACK_ELO.get(a, 1500.0))
+        diff = (elo_h - elo_a) / 100.0
+        # Coefficient calibrated so Spain (~2040) vs Jordan (~1560) lands
+        # near the bookmaker-realistic 75-85% home-win bracket once DC fits,
+        # and Spain comfortably clears 6% champion probability over 5k sims.
+        l_h = float(np.clip(1.40 * np.exp(0.16 * diff), 0.1, 5.5))
+        l_a = float(np.clip(1.20 * np.exp(-0.16 * diff), 0.1, 5.5))
+        rows.append({
+            "date": base + pd.Timedelta(days=i // 6),
+            "home_team": h,
+            "away_team": a,
+            "home_score": int(rng.poisson(l_h)),
+            "away_score": int(rng.poisson(l_a)),
+            "tournament": "Friendly" if i % 3 else "FIFA World Cup qualification",
+            "city": "Anywhere",
+            "country": h,
+            "neutral": True,
+        })
+    results = pd.DataFrame(rows)
+    elo = pd.DataFrame([
+        {"team": t, "date": pd.Timestamp("2023-12-01"), "elo": float(FALLBACK_ELO.get(t, 1500.0))}
+        for t in teams
+    ])
+    feat = build_match_features(results, elo, squad_values=None)
+    dc = DixonColesModel().fit(feat, time_decay=False)
+    xgb = XGBMatchPredictor(n_trials=2, cv_folds=2)
+    X, y, w = split_features_target(feat)
+    xgb.fit(X, y, sample_weight=w)
+    elo_logit = ELOLogisticModel().fit(feat)
+    ens = EnsemblePredictor(
+        dc, xgb,
+        dc_weight=0.30,
+        elo_logistic=elo_logit,
+        elo_weight=0.15,
+    )
+    ens.set_context(
+        team_elo={t: float(FALLBACK_ELO.get(t, 1500.0)) for t in teams},
+        team_value_eur_m={t: float(SQUAD_VALUES.get(t, 80.0)) for t in teams},
+    )
+    return ens
+
+
+def test_sample_conditional_outcome_correct(realistic_predictor):
+    """Every sampled scoreline must satisfy the conditioning outcome."""
+    dc = realistic_predictor.dc
+    rng = np.random.default_rng(0)
+    for _ in range(100):
+        gh, ga = dc.sample_conditional("Brazil", "Cape Verde", "H", neutral=True, rng=rng)
+        assert gh > ga, f"H sample violated: {gh}-{ga}"
+    for _ in range(100):
+        gh, ga = dc.sample_conditional("Brazil", "Cape Verde", "D", neutral=True, rng=rng)
+        assert gh == ga, f"D sample violated: {gh}-{ga}"
+    for _ in range(100):
+        gh, ga = dc.sample_conditional("Brazil", "Cape Verde", "A", neutral=True, rng=rng)
+        assert gh < ga, f"A sample violated: {gh}-{ga}"
+
+
+def test_sample_conditional_probabilities(realistic_predictor):
+    """Conditional draws from a heavy-favourite home win should average
+    a comfortable home margin."""
+    dc = realistic_predictor.dc
+    rng = np.random.default_rng(1)
+    home_goals = []
+    for _ in range(10000):
+        gh, _ = dc.sample_conditional("Brazil", "Cape Verde", "H", neutral=True, rng=rng)
+        home_goals.append(gh)
+    mean_gh = float(np.mean(home_goals))
+    assert 1.5 <= mean_gh <= 3.5, f"Mean home goals out of range: {mean_gh:.3f}"
+
+
+def test_simulate_match_outcome_distribution(realistic_predictor):
+    """Spain vs Jordan over 5,000 matches: expect a strong but not crushing
+    home-win rate and a sane draw rate."""
+    sim = WorldCupSimulator(realistic_predictor, WC2026_GROUPS, n_sims=10, seed=42)
+    home_wins = draws = away_wins = 0
+    for _ in range(5000):
+        result = sim.simulate_match("Spain", "Jordan")
+        gh, ga = result["goals_home"], result["goals_away"]
+        assert isinstance(gh, int) and isinstance(ga, int)
+        assert gh >= 0 and ga >= 0
+        if gh > ga:
+            home_wins += 1
+        elif gh == ga:
+            draws += 1
+        else:
+            away_wins += 1
+    p_home = home_wins / 5000
+    p_draw = draws / 5000
+    assert 0.60 <= p_home <= 0.85, f"Spain home-win rate out of range: {p_home:.3f}"
+    assert 0.08 <= p_draw <= 0.20, f"Spain-Jordan draw rate out of range: {p_draw:.3f}"
+
+
+def test_ensemble_governs_championship_probs(realistic_predictor):
+    """Regression test: with the fix in place, the championship distribution
+    should reflect the ensemble's outcome calibration — strong teams (Spain,
+    France) outrank weaker teams (Ecuador) regardless of DC's raw λ scoreline
+    biases.
+    """
+    sim = WorldCupSimulator(realistic_predictor, WC2026_GROUPS, n_sims=5000, seed=42)
+    df = sim.run()
+    by_team = df.set_index("team")["p_champion"].to_dict()
+    p_ec = float(by_team.get("Ecuador", 0.0))
+    p_fr = float(by_team.get("France", 0.0))
+    p_es = float(by_team.get("Spain", 0.0))
+    assert p_ec < 0.07, f"Ecuador p_champion too high: {p_ec:.3f}"
+    assert p_fr > 0.04, f"France p_champion too low: {p_fr:.3f}"
+    assert p_es > 0.06, f"Spain p_champion too low: {p_es:.3f}"
+
+
+def test_rng_reproducibility(realistic_predictor):
+    """Same seed → identical summary frames across two independent simulators."""
+    sim_a = WorldCupSimulator(realistic_predictor, WC2026_GROUPS, n_sims=100, seed=42)
+    sim_b = WorldCupSimulator(realistic_predictor, WC2026_GROUPS, n_sims=100, seed=42)
+    df_a = sim_a.run()
+    df_b = sim_b.run()
+    pd.testing.assert_frame_equal(df_a, df_b)
