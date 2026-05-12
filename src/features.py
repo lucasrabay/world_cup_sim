@@ -10,8 +10,10 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
 
 from .data_loader import FALLBACK_ELO, SQUAD_VALUES
+from .odds_loader import FALLBACK_ODDS, odds_to_implied_prob
 from .utils import get_logger, load_config, normalise_team
 
 logger = get_logger(__name__)
@@ -55,28 +57,75 @@ CONFEDERATION_DIFFICULTY: dict[str, float] = {
 }
 
 
-# Confederation lookup for all 48 WC 2026 participants.
+# Confederation lookup. Covers WC 2026 participants plus the historical teams
+# that show up in the international_results dataset — needed for
+# ``fit_confederation_difficulty`` to actually find cross-confederation rows.
 TEAM_CONFEDERATION: dict[str, str] = {
-    # UEFA
+    # ----- UEFA (Europe) -----
     "England": "UEFA", "France": "UEFA", "Spain": "UEFA", "Germany": "UEFA",
     "Portugal": "UEFA", "Netherlands": "UEFA", "Belgium": "UEFA", "Norway": "UEFA",
     "Croatia": "UEFA", "Switzerland": "UEFA", "Austria": "UEFA", "Sweden": "UEFA",
     "Turkey": "UEFA", "Bosnia and Herzegovina": "UEFA", "Scotland": "UEFA", "Czechia": "UEFA",
-    # CONMEBOL
+    "Italy": "UEFA", "Russia": "UEFA", "Soviet Union": "UEFA", "Yugoslavia": "UEFA",
+    "Serbia": "UEFA", "Serbia and Montenegro": "UEFA", "Poland": "UEFA",
+    "Romania": "UEFA", "Bulgaria": "UEFA", "Denmark": "UEFA", "Hungary": "UEFA",
+    "Greece": "UEFA", "Republic of Ireland": "UEFA", "Northern Ireland": "UEFA",
+    "Wales": "UEFA", "Iceland": "UEFA", "Ukraine": "UEFA", "Slovakia": "UEFA",
+    "Slovenia": "UEFA", "North Macedonia": "UEFA", "East Germany": "UEFA",
+    "West Germany": "UEFA", "Albania": "UEFA", "Belarus": "UEFA",
+    "Estonia": "UEFA", "Finland": "UEFA", "Georgia": "UEFA", "Latvia": "UEFA",
+    "Lithuania": "UEFA", "Luxembourg": "UEFA", "Malta": "UEFA",
+    "Moldova": "UEFA", "Montenegro": "UEFA", "Kosovo": "UEFA", "Cyprus": "UEFA",
+    "Andorra": "UEFA", "Armenia": "UEFA", "Azerbaijan": "UEFA", "Faroe Islands": "UEFA",
+    "Gibraltar": "UEFA", "Israel": "UEFA", "Kazakhstan": "UEFA", "Liechtenstein": "UEFA",
+    "San Marino": "UEFA",
+    # ----- CONMEBOL (South America) -----
     "Brazil": "CONMEBOL", "Argentina": "CONMEBOL", "Colombia": "CONMEBOL",
     "Uruguay": "CONMEBOL", "Ecuador": "CONMEBOL", "Paraguay": "CONMEBOL",
-    # CONCACAF
+    "Chile": "CONMEBOL", "Peru": "CONMEBOL", "Bolivia": "CONMEBOL", "Venezuela": "CONMEBOL",
+    # ----- CONCACAF (N/C America + Caribbean) -----
     "USA": "CONCACAF", "Mexico": "CONCACAF", "Canada": "CONCACAF",
     "Panama": "CONCACAF", "Haiti": "CONCACAF", "Curacao": "CONCACAF",
-    # CAF
+    "Costa Rica": "CONCACAF", "Honduras": "CONCACAF", "El Salvador": "CONCACAF",
+    "Guatemala": "CONCACAF", "Jamaica": "CONCACAF", "Cuba": "CONCACAF",
+    "Trinidad and Tobago": "CONCACAF", "Nicaragua": "CONCACAF",
+    "Bermuda": "CONCACAF", "Belize": "CONCACAF",
+    # ----- CAF (Africa) -----
     "Senegal": "CAF", "Morocco": "CAF", "Ivory Coast": "CAF", "Egypt": "CAF",
     "Algeria": "CAF", "Ghana": "CAF", "Tunisia": "CAF", "South Africa": "CAF",
     "Cape Verde": "CAF", "DR Congo": "CAF",
-    # AFC
+    "Cameroon": "CAF", "Nigeria": "CAF", "Angola": "CAF", "Togo": "CAF",
+    "Zaire": "CAF", "Sudan": "CAF", "Mali": "CAF", "Burkina Faso": "CAF",
+    "Guinea": "CAF", "Zambia": "CAF", "Mozambique": "CAF", "Madagascar": "CAF",
+    "Ethiopia": "CAF", "Kenya": "CAF", "Tanzania": "CAF", "Uganda": "CAF",
+    "Libya": "CAF", "Mauritania": "CAF", "Benin": "CAF", "Niger": "CAF",
+    "Sierra Leone": "CAF", "Liberia": "CAF", "Gabon": "CAF", "Congo": "CAF",
+    "Equatorial Guinea": "CAF", "Central African Republic": "CAF",
+    "Botswana": "CAF", "Namibia": "CAF", "Zimbabwe": "CAF", "Malawi": "CAF",
+    "Burundi": "CAF", "Rwanda": "CAF", "Chad": "CAF", "Comoros": "CAF",
+    "Eritrea": "CAF", "Eswatini": "CAF", "Lesotho": "CAF", "Mauritius": "CAF",
+    "Sao Tome and Principe": "CAF", "Seychelles": "CAF", "Somalia": "CAF",
+    "South Sudan": "CAF", "Djibouti": "CAF", "Gambia": "CAF",
+    "Guinea-Bissau": "CAF",
+    # ----- AFC (Asia + AUS) -----
     "Japan": "AFC", "South Korea": "AFC", "Australia": "AFC", "Saudi Arabia": "AFC",
     "Qatar": "AFC", "Iran": "AFC", "Jordan": "AFC", "Iraq": "AFC", "Uzbekistan": "AFC",
-    # OFC
+    "China PR": "AFC", "China": "AFC", "North Korea": "AFC",
+    "Kuwait": "AFC", "United Arab Emirates": "AFC", "Bahrain": "AFC", "Oman": "AFC",
+    "Lebanon": "AFC", "Syria": "AFC", "Palestine": "AFC", "Yemen": "AFC",
+    "Indonesia": "AFC", "Malaysia": "AFC", "Singapore": "AFC", "Thailand": "AFC",
+    "Vietnam": "AFC", "Philippines": "AFC", "Myanmar": "AFC", "Cambodia": "AFC",
+    "Hong Kong": "AFC", "Taiwan": "AFC", "Chinese Taipei": "AFC",
+    "Tajikistan": "AFC", "Turkmenistan": "AFC", "Kyrgyzstan": "AFC", "Afghanistan": "AFC",
+    "Maldives": "AFC", "Nepal": "AFC", "Sri Lanka": "AFC", "Pakistan": "AFC",
+    "Bangladesh": "AFC", "India": "AFC", "Bhutan": "AFC", "Brunei": "AFC",
+    "Macau": "AFC", "Mongolia": "AFC", "Laos": "AFC", "Timor-Leste": "AFC",
+    "Guam": "AFC", "Northern Mariana Islands": "AFC",
+    # ----- OFC (Oceania) -----
     "New Zealand": "OFC",
+    "Fiji": "OFC", "Papua New Guinea": "OFC", "Solomon Islands": "OFC",
+    "Tahiti": "OFC", "Vanuatu": "OFC", "Samoa": "OFC", "Tonga": "OFC",
+    "American Samoa": "OFC", "Cook Islands": "OFC",
 }
 
 
@@ -114,6 +163,153 @@ WC_KNOCKOUT_WIN_RATE: dict[str, float] = {
     "Haiti": 0.10,
 }
 DEFAULT_KO_RATE = 0.20
+
+
+# Conventional canonical ordering used when post-processing the Bradley-Terry
+# fit — empirical fits with limited cross-confederation samples can flip
+# adjacent confederations, so we enforce the ordering UEFA > CONMEBOL > AFC >
+# CAF > CONCACAF > OFC by sorting the fitted magnitudes into these slots.
+_CONFEDERATION_ORDER: tuple[str, ...] = (
+    "UEFA", "CONMEBOL", "AFC", "CAF", "CONCACAF", "OFC",
+)
+
+
+# ---------------------------------------------------------------------------
+# Confederation difficulty — empirical fit
+# ---------------------------------------------------------------------------
+def fit_confederation_difficulty(
+    results_df: pd.DataFrame,
+    tournament_filter: str = "FIFA World Cup",
+    min_year: int = 1990,
+    min_matches: int = 50,
+) -> dict[str, float]:
+    """Fit a per-confederation strength scalar from cross-confederation WC matches.
+
+    Method
+    ------
+    1. Filter to WC matches (excluding qualification) from ``min_year`` onwards.
+    2. Keep only matches where home and away teams belong to **different**
+       confederations — this is the only unbiased cross-confederation signal.
+    3. For each ordered confederation pair (a, b), compute
+       ``win_rate_a = (wins_a + 0.5 * draws) / total``.
+    4. Anchor UEFA at 1.0 and fit a single scalar per other confederation by
+       minimising sum-of-squared-errors between the observed pair win rates
+       and Bradley-Terry-implied rates ``s_a / (s_a + s_b)``, weighted by
+       sample count.
+    5. Clamp results into the plausible range [0.30, 1.00].
+    6. Apply the canonical UEFA > CONMEBOL > AFC > CAF > CONCACAF > OFC
+       ordering by sorting fitted magnitudes into these slots — this prevents
+       small-sample inversions on adjacent confederations.
+
+    Returns
+    -------
+    dict mapping confederation name → scalar in [0.30, 1.00] with UEFA = 1.0.
+    Falls back to the conventional hardcoded values when there are too few
+    cross-confederation matches to fit reliably.
+    """
+    fallback = dict(CONFEDERATION_DIFFICULTY)
+    if results_df is None or results_df.empty:
+        logger.warning("No results frame supplied; using hardcoded confederation scalars")
+        return fallback
+
+    df = results_df.copy()
+    df["tournament"] = df["tournament"].astype(str)
+    is_wc = (
+        df["tournament"].str.contains(tournament_filter, case=False, na=False)
+        & ~df["tournament"].str.contains("qualification", case=False, na=False)
+    )
+    df = df[is_wc].copy()
+    df = df[df["date"] >= pd.Timestamp(year=min_year, month=1, day=1)]
+    df["home_conf"] = df["home_team"].map(TEAM_CONFEDERATION)
+    df["away_conf"] = df["away_team"].map(TEAM_CONFEDERATION)
+    df = df.dropna(subset=["home_conf", "away_conf"])
+    cross = df[df["home_conf"] != df["away_conf"]]
+
+    if len(cross) < min_matches:
+        logger.warning(
+            "Only %d cross-confederation WC matches since %d (need %d) — using hardcoded scalars",
+            len(cross), min_year, min_matches,
+        )
+        return fallback
+
+    # Build per-pair (canonical alphabetical) accumulators: total matches and
+    # the share won by the first confederation in the sorted pair.
+    pair_first_score: dict[tuple[str, str], float] = {}
+    pair_total: dict[tuple[str, str], int] = {}
+    for row in cross.itertuples(index=False):
+        h_conf, a_conf = row.home_conf, row.away_conf
+        pair = tuple(sorted([h_conf, a_conf]))
+        if row.home_score > row.away_score:
+            home_share = 1.0
+        elif row.home_score < row.away_score:
+            home_share = 0.0
+        else:
+            home_share = 0.5
+        first_share = home_share if h_conf == pair[0] else 1.0 - home_share
+        pair_first_score[pair] = pair_first_score.get(pair, 0.0) + first_share
+        pair_total[pair] = pair_total.get(pair, 0) + 1
+
+    # Pair observations weighted by sample count.
+    pair_obs: list[tuple[str, str, float, int]] = []
+    for pair, total in pair_total.items():
+        if total < 2:
+            continue
+        observed = pair_first_score[pair] / total
+        pair_obs.append((pair[0], pair[1], observed, total))
+    if not pair_obs:
+        logger.warning("No usable confederation pairs — using hardcoded scalars")
+        return fallback
+
+    confs = sorted({c for c in TEAM_CONFEDERATION.values()} | {p[0] for p in pair_obs} | {p[1] for p in pair_obs})
+    # Anchor UEFA at 1.0, fit the rest.
+    fitted_confs = [c for c in confs if c != "UEFA"]
+    n_params = len(fitted_confs)
+
+    def _scalars(params: np.ndarray) -> dict[str, float]:
+        out = {"UEFA": 1.0}
+        for i, c in enumerate(fitted_confs):
+            out[c] = float(params[i])
+        return out
+
+    def _loss(params: np.ndarray) -> float:
+        s = _scalars(params)
+        sse = 0.0
+        for a, b, observed, total in pair_obs:
+            sa, sb = s.get(a, 1e-6), s.get(b, 1e-6)
+            if sa + sb <= 0:
+                continue
+            pred = sa / (sa + sb)
+            sse += float(total) * (pred - observed) ** 2
+        return sse
+
+    x0 = np.full(n_params, 0.7)
+    bounds = [(0.10, 1.30)] * n_params
+    res = minimize(_loss, x0, method="L-BFGS-B", bounds=bounds, options={"maxiter": 200})
+    raw_fit = _scalars(res.x)
+
+    # Clamp into the allowed band and warn on anything outside [0.30, 1.00].
+    clamped: dict[str, float] = {}
+    for c, v in raw_fit.items():
+        if not (0.30 <= v <= 1.00):
+            logger.warning("Confederation scalar for %s out of range (%.3f) — clamping", c, v)
+        clamped[c] = float(np.clip(v, 0.30, 1.00))
+    clamped["UEFA"] = 1.0  # always preserve the anchor exactly
+
+    # Enforce canonical ordering by reshuffling the fitted magnitudes into the
+    # canonical slots — preserves the magnitudes the data wants, but pins
+    # which confederation receives which.
+    canonical = [c for c in _CONFEDERATION_ORDER if c in clamped]
+    sorted_values = sorted(
+        (clamped[c] for c in canonical), reverse=True,
+    )
+    final: dict[str, float] = {}
+    for slot, val in zip(canonical, sorted_values):
+        final[slot] = val
+    # Make sure all six canonical confederations have an entry (fall back if missing).
+    for c in _CONFEDERATION_ORDER:
+        final.setdefault(c, fallback.get(c, 0.5))
+    final["UEFA"] = 1.0  # anchor invariant after sorting
+    return final
 
 
 # Squad-value tier (1=minnow ... 5=elite). Trees handle these buckets cleanly.
@@ -160,6 +356,9 @@ FEATURE_COLUMNS: list[str] = [
     "wc_knockout_rate_home",
     "wc_knockout_rate_away",
     "wc_knockout_rate_diff",
+    "odds_implied_prob_home",
+    "odds_implied_prob_away",
+    "odds_ratio",
 ]
 
 
@@ -184,14 +383,20 @@ def _classify_tournament(name: str) -> tuple[float, int]:
     return 0.2, 0
 
 
-def _confederation_multiplier(team: str) -> float:
-    return float(CONFEDERATION_DIFFICULTY.get(TEAM_CONFEDERATION.get(team, ""), 1.0))
+def _confederation_multiplier(team: str, scalars: dict[str, float] | None = None) -> float:
+    table = scalars or CONFEDERATION_DIFFICULTY
+    return float(table.get(TEAM_CONFEDERATION.get(team, ""), 1.0))
 
 
-def _qualifying_xgd(team: str) -> float:
-    """xGD discounted by the team's confederation difficulty."""
+def _qualifying_xgd(team: str, scalars: dict[str, float] | None = None) -> float:
+    """xGD discounted by the team's confederation difficulty.
+
+    ``scalars`` overrides the module-level :data:`CONFEDERATION_DIFFICULTY`
+    when supplied — used to plug in empirically fitted values from
+    :func:`fit_confederation_difficulty` without mutating global state.
+    """
     raw = float(QUALIFYING_XGD.get(team, 0.0))
-    return raw * _confederation_multiplier(team)
+    return raw * _confederation_multiplier(team, scalars=scalars)
 
 
 def _fifa_rank(team: str) -> int:
@@ -243,8 +448,22 @@ def build_match_features(
     results_df: pd.DataFrame,
     elo_df: pd.DataFrame,
     squad_values: pd.DataFrame | None,
+    odds_lookup: dict[str, float] | None = None,
+    confederation_scalars: dict[str, float] | None = None,
 ) -> pd.DataFrame:
-    """Build the per-match feature matrix and the target column."""
+    """Build the per-match feature matrix and the target column.
+
+    Parameters
+    ----------
+    odds_lookup : optional ``team -> normalised implied win probability``.
+        Used to populate ``odds_implied_prob_home/away`` and ``odds_ratio``.
+        For historical matches the 2026 odds are reused as a static
+        team-strength proxy — a mild anachronism that the model learns as a
+        per-team prior.
+    confederation_scalars : optional output of
+        :func:`fit_confederation_difficulty` to replace the hardcoded
+        :data:`CONFEDERATION_DIFFICULTY`. ``None`` keeps the hardcoded table.
+    """
     cfg = load_config()
     df = results_df.copy().sort_values("date").reset_index(drop=True)
     df["home_team"] = df["home_team"].map(normalise_team)
@@ -256,6 +475,13 @@ def build_match_features(
         value_lookup = dict(zip(squad_values["team"], squad_values["value_eur_m"]))
 
     elo_lookup = _build_elo_lookup(elo_df)
+
+    # Odds lookup defaults to the FALLBACK_ODDS dict normalised to sum to 1.
+    if odds_lookup is None:
+        raw = {t: odds_to_implied_prob(o) for t, o in FALLBACK_ODDS.items()}
+        total = float(sum(raw.values())) or 1.0
+        odds_lookup = {t: p / total for t, p in raw.items()}
+    default_odds_prob = float(np.mean(list(odds_lookup.values()))) if odds_lookup else 1.0 / 48.0
 
     # Rolling stats containers
     last_n_results: dict[str, deque] = {}
@@ -326,9 +552,17 @@ def build_match_features(
         else:
             h2h_home_wr = 0.5
 
-        # ---- Qualifying xGD (confederation-discounted)
-        xg_h = _qualifying_xgd(h)
-        xg_a = _qualifying_xgd(a)
+        # ---- Qualifying xGD (confederation-discounted, optionally with fitted scalars)
+        xg_h = _qualifying_xgd(h, scalars=confederation_scalars)
+        xg_a = _qualifying_xgd(a, scalars=confederation_scalars)
+
+        # ---- Odds-implied win probability (static 2026 snapshot used for
+        # historical matches too — acts as a team-strength prior)
+        odds_p_h = float(odds_lookup.get(h, default_odds_prob))
+        odds_p_a = float(odds_lookup.get(a, default_odds_prob))
+        odds_ratio = float(
+            np.log((odds_p_h + 1e-9) / (odds_p_a + 1e-9))
+        )
 
         # ---- FIFA rank
         rank_h = _fifa_rank(h)
@@ -390,6 +624,9 @@ def build_match_features(
         out["wc_knockout_rate_home"].append(ko_h)
         out["wc_knockout_rate_away"].append(ko_a)
         out["wc_knockout_rate_diff"].append(ko_diff)
+        out["odds_implied_prob_home"].append(odds_p_h)
+        out["odds_implied_prob_away"].append(odds_p_a)
+        out["odds_ratio"].append(odds_ratio)
 
         extra["date"].append(match_date)
         extra["home_team"].append(h)
@@ -442,4 +679,5 @@ __all__ = [
     "FEATURE_COLUMNS",
     "build_match_features",
     "split_features_target",
+    "fit_confederation_difficulty",
 ]

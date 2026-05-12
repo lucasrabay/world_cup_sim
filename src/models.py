@@ -601,20 +601,73 @@ class ELOLogisticModel:
 
 
 # ---------------------------------------------------------------------------
+# Pre-tournament odds baseline
+# ---------------------------------------------------------------------------
+class OddsBaselineModel:
+    """A trivial outright-odds-driven head.
+
+    Reads the team's pre-tournament tournament-winner implied probability and
+    converts it into a head-to-head match outcome via Bradley-Terry. A fixed
+    historical World Cup draw rate of 23% is reserved; the remaining 77% is
+    split between the two sides proportionally to their outright strength.
+
+    This model is read-only — it requires no training, just a lookup table.
+    """
+
+    def __init__(self, odds_dict: dict[str, float], draw_prob: float = 0.23) -> None:
+        # Store a defensive copy; values should be non-negative.
+        self.odds_dict: dict[str, float] = {str(t): float(p) for t, p in odds_dict.items()}
+        self.draw_prob: float = float(np.clip(draw_prob, 0.0, 0.99))
+        self._uniform = 1.0 / max(len(self.odds_dict), 1)
+
+    def _lookup(self, team: str) -> float:
+        p = self.odds_dict.get(team)
+        if p is None or p <= 0:
+            return self._uniform
+        return float(p)
+
+    def predict(self, home_team: str, away_team: str, neutral: bool = True) -> dict[str, float]:
+        """Return ``{home_win, draw, away_win}`` summing to 1.0."""
+        p_h_out = self._lookup(home_team)
+        p_a_out = self._lookup(away_team)
+        denom = p_h_out + p_a_out
+        if denom <= 0:
+            return {"home_win": (1.0 - self.draw_prob) / 2.0,
+                    "draw": self.draw_prob,
+                    "away_win": (1.0 - self.draw_prob) / 2.0}
+        bt_home = p_h_out / denom
+        non_draw = 1.0 - self.draw_prob
+        return {
+            "home_win": float(bt_home * non_draw),
+            "draw": float(self.draw_prob),
+            "away_win": float((1.0 - bt_home) * non_draw),
+        }
+
+
+# ---------------------------------------------------------------------------
 # Ensemble
 # ---------------------------------------------------------------------------
 class EnsemblePredictor:
-    """Three-way convex combination of Dixon-Coles, calibrated XGBoost, and a
-    simple ELO-only logistic regression.
+    """Convex combination of up to four heads:
 
-    The XGBoost classifier needs a feature row, which is built lazily from the
-    most recent ELO/value/xGD context held by this object — set those via
-    ``set_context()`` once after training.
+        * Dixon-Coles            — scoreline-aware Poisson model.
+        * XGBoost (calibrated)   — feature-rich tabular classifier.
+        * ELO logistic           — conservative single-feature anchor.
+        * Odds baseline          — pre-tournament market consensus.
 
-    Default weights (DC=0.30, XGB=0.55, ELO=0.15) place the most trust in the
-    feature-rich classifier while keeping the scoreline-aware DC head and a
-    conservative ELO anchor in the mix. When ``elo_logistic`` is None the ELO
-    weight collapses into ``dc_weight`` so the binary-blend API still works.
+    The XGBoost classifier reads a single-row feature frame built lazily from
+    the team context — call :meth:`set_context` once after training to set
+    ELO, squad value, and odds-implied probabilities for the 48 teams.
+
+    Default 4-way weights are ``(DC=0.25, XGB=0.45, ELO=0.10, Odds=0.20)`` —
+    the trained model still dominates, but the market gets a meaningful pull
+    so blatantly mis-priced model bets get reined in.
+
+    Backwards compatibility
+    -----------------------
+    Older callers that pass only ``dc_weight=...`` (or omit ``odds_baseline``)
+    are still supported: missing components simply drop out of the blend, with
+    their weight absorbed into the remaining components and renormalised.
     """
 
     def __init__(
@@ -624,36 +677,73 @@ class EnsemblePredictor:
         dc_weight: float | None = None,
         elo_logistic: "ELOLogisticModel | None" = None,
         elo_weight: float | None = None,
+        odds_baseline: "OddsBaselineModel | None" = None,
+        odds_weight: float | None = None,
+        weights: tuple[float, ...] | None = None,
     ) -> None:
         self.dc = dc_model
         self.xgb = xgb_model
         self.elo_logistic = elo_logistic
+        self.odds_baseline = odds_baseline
 
-        # Weight resolution. We always normalise the final triple, so callers
-        # can pass any non-negative numbers.
-        if dc_weight is None and elo_weight is None and elo_logistic is not None:
-            dc_weight, xgb_w, elo_weight = 0.30, 0.55, 0.15
+        # ---- resolve four weights -----------------------------------------
+        if weights is not None:
+            if len(weights) == 4:
+                dc_w, xgb_w, elo_w, odds_w = (float(w) for w in weights)
+            elif len(weights) == 3:
+                dc_w, xgb_w, elo_w = (float(w) for w in weights)
+                odds_w = 0.0
+            else:
+                raise ValueError(
+                    f"weights tuple must have length 3 or 4, got {len(weights)}"
+                )
+        elif (
+            dc_weight is None and elo_weight is None and odds_weight is None
+            and elo_logistic is not None and odds_baseline is not None
+        ):
+            # Canonical four-component default.
+            dc_w, xgb_w, elo_w, odds_w = 0.25, 0.45, 0.10, 0.20
+        elif (
+            dc_weight is None and elo_weight is None and odds_weight is None
+            and elo_logistic is not None and odds_baseline is None
+        ):
+            # Canonical three-component default.
+            dc_w, xgb_w, elo_w, odds_w = 0.30, 0.55, 0.15, 0.0
         else:
-            if dc_weight is None:
-                dc_weight = 0.5
-            if elo_logistic is None or elo_weight is None:
-                elo_weight = 0.0
-            xgb_w = max(0.0, 1.0 - float(dc_weight) - float(elo_weight))
+            dc_w = float(dc_weight) if dc_weight is not None else 0.5
+            elo_w = float(elo_weight) if (elo_weight is not None and elo_logistic is not None) else 0.0
+            odds_w = float(odds_weight) if (odds_weight is not None and odds_baseline is not None) else 0.0
+            xgb_w = max(0.0, 1.0 - dc_w - elo_w - odds_w)
 
-        total = float(dc_weight) + float(xgb_w) + float(elo_weight)
+        # Force-zero weights for missing heads.
+        if elo_logistic is None:
+            elo_w = 0.0
+        if odds_baseline is None:
+            odds_w = 0.0
+
+        total = dc_w + xgb_w + elo_w + odds_w
         if total <= 0:
-            dc_weight, xgb_w, elo_weight = 0.5, 0.5, 0.0
+            dc_w, xgb_w, elo_w, odds_w = 0.5, 0.5, 0.0, 0.0
             total = 1.0
-        self.dc_weight = float(dc_weight) / total
-        self.xgb_weight = float(xgb_w) / total
-        self.elo_weight = float(elo_weight) / total
+        self.dc_weight = dc_w / total
+        self.xgb_weight = xgb_w / total
+        self.elo_weight = elo_w / total
+        self.odds_weight = odds_w / total
 
         self._team_elo: dict[str, float] = {}
         self._team_value: dict[str, float] = {}
+        self._team_odds: dict[str, float] = {}
 
-    def set_context(self, team_elo: dict[str, float], team_value_eur_m: dict[str, float]) -> None:
+    def set_context(
+        self,
+        team_elo: dict[str, float],
+        team_value_eur_m: dict[str, float],
+        team_odds: dict[str, float] | None = None,
+    ) -> None:
         self._team_elo = dict(team_elo)
         self._team_value = dict(team_value_eur_m)
+        if team_odds is not None:
+            self._team_odds = dict(team_odds)
 
     def _xgb_features_for(self, home_team: str, away_team: str, neutral: bool) -> pd.DataFrame:
         """Construct a single-row feature frame matching FEATURE_COLUMNS."""
@@ -686,6 +776,12 @@ class EnsemblePredictor:
         xg_h = float(QUALIFYING_XGD.get(home_team, 0.0)) * cm_h
         xg_a = float(QUALIFYING_XGD.get(away_team, 0.0)) * cm_a
 
+        # Odds-implied probabilities — fall back to a uniform 1/48 if missing
+        default_odds = 1.0 / 48.0
+        odds_p_h = float(self._team_odds.get(home_team, default_odds))
+        odds_p_a = float(self._team_odds.get(away_team, default_odds))
+        odds_ratio = float(np.log((odds_p_h + 1e-9) / (odds_p_a + 1e-9)))
+
         row = {
             "elo_home": elo_h,
             "elo_away": elo_a,
@@ -716,6 +812,9 @@ class EnsemblePredictor:
             "wc_knockout_rate_home": ko_h,
             "wc_knockout_rate_away": ko_a,
             "wc_knockout_rate_diff": ko_h - ko_a,
+            "odds_implied_prob_home": odds_p_h,
+            "odds_implied_prob_away": odds_p_a,
+            "odds_ratio": odds_ratio,
         }
         return pd.DataFrame([row])[FEATURE_COLUMNS]
 
@@ -742,21 +841,30 @@ class EnsemblePredictor:
         else:
             elo_pred = {"home_win": dc["home_win"], "draw": dc["draw"], "away_win": dc["away_win"]}
 
+        # Odds baseline (or fall back to DC if not provided)
+        if self.odds_baseline is not None and self.odds_weight > 0:
+            odds_pred = self.odds_baseline.predict(home_team, away_team, neutral=neutral)
+        else:
+            odds_pred = {"home_win": dc["home_win"], "draw": dc["draw"], "away_win": dc["away_win"]}
+
         blended = {
             "home_win": (
                 self.dc_weight * dc["home_win"]
                 + self.xgb_weight * xgb_pred["home_win"]
                 + self.elo_weight * elo_pred["home_win"]
+                + self.odds_weight * odds_pred["home_win"]
             ),
             "draw": (
                 self.dc_weight * dc["draw"]
                 + self.xgb_weight * xgb_pred["draw"]
                 + self.elo_weight * elo_pred["draw"]
+                + self.odds_weight * odds_pred["draw"]
             ),
             "away_win": (
                 self.dc_weight * dc["away_win"]
                 + self.xgb_weight * xgb_pred["away_win"]
                 + self.elo_weight * elo_pred["away_win"]
+                + self.odds_weight * odds_pred["away_win"]
             ),
             "lambda_home": dc["lambda_home"],
             "lambda_away": dc["lambda_away"],
@@ -872,6 +980,7 @@ __all__ = [
     "DixonColesModel",
     "XGBMatchPredictor",
     "ELOLogisticModel",
+    "OddsBaselineModel",
     "EnsemblePredictor",
     "evaluate_model",
 ]
