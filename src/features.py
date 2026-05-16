@@ -129,6 +129,213 @@ TEAM_CONFEDERATION: dict[str, str] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Historical WC group draws (for retrofitting path-difficulty features onto
+# the held-out WC 2018 + WC 2022 matches). Team names match the canonical
+# normalisation produced by :func:`normalise_team`.
+# ---------------------------------------------------------------------------
+HISTORICAL_WC_GROUPS: dict[int, dict[str, list[str]]] = {
+    2018: {
+        "A": ["Russia", "Saudi Arabia", "Egypt", "Uruguay"],
+        "B": ["Portugal", "Spain", "Morocco", "Iran"],
+        "C": ["France", "Australia", "Peru", "Denmark"],
+        "D": ["Argentina", "Iceland", "Croatia", "Nigeria"],
+        "E": ["Brazil", "Switzerland", "Costa Rica", "Serbia"],
+        "F": ["Germany", "Mexico", "Sweden", "South Korea"],
+        "G": ["Belgium", "Panama", "Tunisia", "England"],
+        "H": ["Poland", "Senegal", "Colombia", "Japan"],
+    },
+    2022: {
+        "A": ["Qatar", "Ecuador", "Senegal", "Netherlands"],
+        "B": ["England", "Iran", "USA", "Wales"],
+        "C": ["Argentina", "Saudi Arabia", "Mexico", "Poland"],
+        "D": ["France", "Australia", "Denmark", "Tunisia"],
+        "E": ["Spain", "Costa Rica", "Germany", "Japan"],
+        "F": ["Belgium", "Canada", "Morocco", "Croatia"],
+        "G": ["Brazil", "Serbia", "Switzerland", "Cameroon"],
+        "H": ["Portugal", "Ghana", "Uruguay", "South Korea"],
+    },
+}
+
+# 32-team format halves (top half = ABCD, bottom = EFGH).
+HISTORICAL_BRACKET_HALF: dict[str, int] = {
+    "A": 0, "B": 0, "C": 0, "D": 0,
+    "E": 1, "F": 1, "G": 1, "H": 1,
+}
+
+# 32-team R16 pairings (within-half by adjacent letter).
+HISTORICAL_ADJACENT_GROUP: dict[str, str] = {
+    "A": "B", "B": "A",
+    "C": "D", "D": "C",
+    "E": "F", "F": "E",
+    "G": "H", "H": "G",
+}
+
+# 48-team WC 2026 halves per the task spec.
+WC2026_BRACKET_HALF: dict[str, int] = {
+    "A": 0, "C": 0, "E": 0, "G": 0, "I": 0, "K": 0,
+    "B": 1, "D": 1, "F": 1, "H": 1, "J": 1, "L": 1,
+}
+
+# 48-team R32 adjacent group (within the same half) — used to compute the
+# "expected R32 opponent". Within each half we pair groups in the order they
+# appear in the bracket template.
+WC2026_ADJACENT_GROUP: dict[str, str] = {
+    # half 0
+    "A": "C", "C": "A",
+    "E": "G", "G": "E",
+    "I": "K", "K": "I",
+    # half 1
+    "B": "D", "D": "B",
+    "F": "H", "H": "F",
+    "J": "L", "L": "J",
+}
+
+
+# Date windows for picking the right historical-WC group lookup.
+def _historical_wc_year(match_date: pd.Timestamp) -> int | None:
+    """Return 2018 / 2022 if the match falls inside the corresponding WC
+    fortnight, else None."""
+    if pd.Timestamp("2018-06-14") <= match_date <= pd.Timestamp("2018-07-15"):
+        return 2018
+    if pd.Timestamp("2022-11-20") <= match_date <= pd.Timestamp("2022-12-18"):
+        return 2022
+    return None
+
+
+# Path-feature keys — used both to populate FEATURE_COLUMNS and to zero-fill
+# the columns for non-WC matches.
+PATH_FEATURE_KEYS: tuple[str, ...] = (
+    "group_avg_elo_opponents",
+    "group_max_elo_opponent",
+    "group_elo_rank",
+    "bracket_half",
+    "expected_r16_opponent_elo",
+    "path_to_final_avg_elo",
+)
+
+
+def compute_path_features(
+    team: str,
+    groups: dict[str, list[str]],
+    elo_lookup: dict[str, float],
+    bracket_half_map: dict[str, int],
+    adjacent_group_map: dict[str, str],
+) -> dict[str, float]:
+    """Return the six path-difficulty features for ``team`` given a static
+    group draw + ELO snapshot.
+
+    Definitions
+    -----------
+    * ``group_avg_elo_opponents`` — mean ELO of the other 3 teams in the team's
+      group.
+    * ``group_max_elo_opponent`` — max ELO of the other 3 teams (Group of
+      Death ceiling).
+    * ``group_elo_rank`` — team's rank within their own group, 1 = highest
+      ELO, 4 = lowest.
+    * ``bracket_half`` — half-of-bracket assignment (0 or 1).
+    * ``expected_r16_opponent_elo`` — ELO of the 2nd-strongest team in the
+      adjacent (R32-paired) group — the likely group-stage runner-up that
+      would face this team in the early KO round.
+    * ``path_to_final_avg_elo`` — round-weighted average opponent ELO across
+      the full path including the 3 group games and the 4 KO rounds. Weights:
+      group games = 1.0 each, R32 = 1.0, R16 = 1.5, QF = 2.0, SF = 2.5.
+      Higher = harder.
+
+      We include the group stage in this aggregate because, with sparse
+      cross-confederation data, the strongest signal that bookmakers price in
+      for tournament path difficulty is "how forgiving is your group?" — a
+      pure KO-only aggregate buries that signal under largely-symmetric half
+      strength.
+    """
+    # Find the team's group.
+    own_group: str | None = None
+    for letter, members in groups.items():
+        if team in members:
+            own_group = letter
+            break
+    if own_group is None:
+        return {k: 0.0 for k in PATH_FEATURE_KEYS}
+
+    def _e(t: str) -> float:
+        return float(elo_lookup.get(t, FALLBACK_ELO.get(t, 1500.0)))
+
+    members = list(groups[own_group])
+    opponents = [t for t in members if t != team]
+    opp_elos = [_e(t) for t in opponents]
+    own_elo = _e(team)
+    group_avg_elo = float(np.mean(opp_elos)) if opp_elos else 0.0
+    group_max_elo = float(max(opp_elos)) if opp_elos else 0.0
+
+    # Rank 1 = highest ELO in group.
+    sorted_team_elos = sorted(((m, _e(m)) for m in members), key=lambda kv: -kv[1])
+    rank_lookup = {m: i + 1 for i, (m, _v) in enumerate(sorted_team_elos)}
+    own_rank = float(rank_lookup.get(team, 4))
+
+    half = int(bracket_half_map.get(own_group, 0))
+
+    # Expected R32 opponent — 2nd-strongest team in the adjacent group.
+    adj_letter = adjacent_group_map.get(own_group)
+    if adj_letter and adj_letter in groups:
+        adj_elos_desc = sorted((_e(t) for t in groups[adj_letter]), reverse=True)
+        expected_r16_opp = float(adj_elos_desc[1] if len(adj_elos_desc) >= 2 else adj_elos_desc[0])
+    else:
+        # Fall back to average of all other group winners in the same half.
+        fallback_pool: list[float] = []
+        for g, mems in groups.items():
+            if g == own_group or bracket_half_map.get(g) != half:
+                continue
+            fallback_pool.append(max(_e(t) for t in mems))
+        expected_r16_opp = float(np.mean(fallback_pool)) if fallback_pool else group_avg_elo
+
+    # Round-by-round expected opponents inside the team's half. We use the
+    # top-2 ELO of each *other* group in the same half as the candidate pool;
+    # rounds further down the bracket draw against successively stronger
+    # remaining opponents (mean of pool, then max of pool weighted higher).
+    half_pool: list[float] = []
+    for g, mems in groups.items():
+        if g == own_group or bracket_half_map.get(g) != half:
+            continue
+        sorted_g = sorted((_e(t) for t in mems), reverse=True)
+        half_pool.extend(sorted_g[:2])
+    if half_pool:
+        half_mean = float(np.mean(half_pool))
+        half_pool_sorted = sorted(half_pool, reverse=True)
+        # Surrogate "best remaining opponent" rises round-by-round.
+        r16_opp = half_mean
+        qf_opp = float(np.mean(half_pool_sorted[: max(len(half_pool_sorted) // 2, 1)]))
+        sf_opp = float(np.mean(half_pool_sorted[: max(len(half_pool_sorted) // 3, 1)]))
+    else:
+        r16_opp = qf_opp = sf_opp = group_avg_elo
+
+    # Weighted path average: group games + four KO rounds.
+    weights = {
+        "group": 1.0,
+        "r32": 1.0,
+        "r16": 1.5,
+        "qf": 2.0,
+        "sf": 2.5,
+    }
+    weighted_sum = (
+        weights["group"] * sum(opp_elos)            # 3 group games, weight 1 each
+        + weights["r32"] * expected_r16_opp
+        + weights["r16"] * r16_opp
+        + weights["qf"] * qf_opp
+        + weights["sf"] * sf_opp
+    )
+    total_weight = 3 * weights["group"] + weights["r32"] + weights["r16"] + weights["qf"] + weights["sf"]
+    path_to_final = float(weighted_sum / total_weight)
+
+    return {
+        "group_avg_elo_opponents": group_avg_elo,
+        "group_max_elo_opponent": group_max_elo,
+        "group_elo_rank": own_rank,
+        "bracket_half": float(half),
+        "expected_r16_opponent_elo": float(expected_r16_opp),
+        "path_to_final_avg_elo": path_to_final,
+    }
+
+
 # Approximate official FIFA rankings for the 48 WC 2026 participants (May 2026).
 FIFA_RANKING_2026: dict[str, int] = {
     "Spain": 1, "Argentina": 2, "France": 3, "England": 4, "Brazil": 5,
@@ -359,6 +566,21 @@ FEATURE_COLUMNS: list[str] = [
     "odds_implied_prob_home",
     "odds_implied_prob_away",
     "odds_ratio",
+    # ---- Path-difficulty (tournament-context) features ----
+    # Encoded with the suffix _home/_away — non-WC matches are zero-filled
+    # so XGB can route on the existing ``is_wc`` flag.
+    "group_avg_elo_opp_home",
+    "group_avg_elo_opp_away",
+    "group_max_elo_opp_home",
+    "group_max_elo_opp_away",
+    "group_elo_rank_home",
+    "group_elo_rank_away",
+    "bracket_half_home",
+    "bracket_half_away",
+    "expected_r16_opp_elo_home",
+    "expected_r16_opp_elo_away",
+    "path_to_final_avg_elo_home",
+    "path_to_final_avg_elo_away",
 ]
 
 
@@ -483,6 +705,37 @@ def build_match_features(
         odds_lookup = {t: p / total for t, p in raw.items()}
     default_odds_prob = float(np.mean(list(odds_lookup.values()))) if odds_lookup else 1.0 / 48.0
 
+    # Pre-build per-team path features for each historical WC tournament.
+    # Keys: (year, team) -> dict[path_feature_key, value]
+    _wc_path_cache: dict[tuple[int, str], dict[str, float]] = {}
+
+    def _elo_snapshot_for_year(year: int) -> dict[str, float]:
+        # ELO at the start of each WC fortnight (Jun 1 / Nov 1).
+        anchor = (
+            pd.Timestamp(year=year, month=6, day=1) if year == 2018
+            else pd.Timestamp(year=year, month=11, day=1)
+        )
+        anchor_dt64 = np.datetime64(anchor.to_datetime64())
+        return {
+            team: _elo_at(elo_lookup, team, anchor_dt64)
+            for team in {t for ts in HISTORICAL_WC_GROUPS[year].values() for t in ts}
+        }
+
+    def _wc_path_for(year: int, team: str) -> dict[str, float]:
+        key = (year, team)
+        if key in _wc_path_cache:
+            return _wc_path_cache[key]
+        snap = _elo_snapshot_for_year(year)
+        feats = compute_path_features(
+            team,
+            HISTORICAL_WC_GROUPS[year],
+            snap,
+            HISTORICAL_BRACKET_HALF,
+            HISTORICAL_ADJACENT_GROUP,
+        )
+        _wc_path_cache[key] = feats
+        return feats
+
     # Rolling stats containers
     last_n_results: dict[str, deque] = {}
     last_n_for: dict[str, deque] = {}
@@ -564,6 +817,23 @@ def build_match_features(
             np.log((odds_p_h + 1e-9) / (odds_p_a + 1e-9))
         )
 
+        # ---- Path-difficulty features. Only filled for WC 2018/2022
+        # tournament matches (the only historical tournaments for which we
+        # have the group draw); non-WC rows are zero-filled so XGB can route
+        # on ``is_wc`` to ignore them.
+        if is_wc:
+            wc_year = _historical_wc_year(match_date)
+        else:
+            wc_year = None
+        if wc_year is not None and h in {t for ts in HISTORICAL_WC_GROUPS[wc_year].values() for t in ts}:
+            ph = _wc_path_for(wc_year, h)
+        else:
+            ph = {k: 0.0 for k in PATH_FEATURE_KEYS}
+        if wc_year is not None and a in {t for ts in HISTORICAL_WC_GROUPS[wc_year].values() for t in ts}:
+            pa = _wc_path_for(wc_year, a)
+        else:
+            pa = {k: 0.0 for k in PATH_FEATURE_KEYS}
+
         # ---- FIFA rank
         rank_h = _fifa_rank(h)
         rank_a = _fifa_rank(a)
@@ -627,6 +897,18 @@ def build_match_features(
         out["odds_implied_prob_home"].append(odds_p_h)
         out["odds_implied_prob_away"].append(odds_p_a)
         out["odds_ratio"].append(odds_ratio)
+        out["group_avg_elo_opp_home"].append(ph["group_avg_elo_opponents"])
+        out["group_avg_elo_opp_away"].append(pa["group_avg_elo_opponents"])
+        out["group_max_elo_opp_home"].append(ph["group_max_elo_opponent"])
+        out["group_max_elo_opp_away"].append(pa["group_max_elo_opponent"])
+        out["group_elo_rank_home"].append(ph["group_elo_rank"])
+        out["group_elo_rank_away"].append(pa["group_elo_rank"])
+        out["bracket_half_home"].append(ph["bracket_half"])
+        out["bracket_half_away"].append(pa["bracket_half"])
+        out["expected_r16_opp_elo_home"].append(ph["expected_r16_opponent_elo"])
+        out["expected_r16_opp_elo_away"].append(pa["expected_r16_opponent_elo"])
+        out["path_to_final_avg_elo_home"].append(ph["path_to_final_avg_elo"])
+        out["path_to_final_avg_elo_away"].append(pa["path_to_final_avg_elo"])
 
         extra["date"].append(match_date)
         extra["home_team"].append(h)
@@ -677,6 +959,11 @@ __all__ = [
     "WC_KNOCKOUT_WIN_RATE",
     "DEFAULT_KO_RATE",
     "FEATURE_COLUMNS",
+    "PATH_FEATURE_KEYS",
+    "HISTORICAL_WC_GROUPS",
+    "WC2026_BRACKET_HALF",
+    "WC2026_ADJACENT_GROUP",
+    "compute_path_features",
     "build_match_features",
     "split_features_target",
     "fit_confederation_difficulty",

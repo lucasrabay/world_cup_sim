@@ -733,17 +733,22 @@ class EnsemblePredictor:
         self._team_elo: dict[str, float] = {}
         self._team_value: dict[str, float] = {}
         self._team_odds: dict[str, float] = {}
+        self._path_features: dict[str, dict[str, float]] = {}
 
     def set_context(
         self,
         team_elo: dict[str, float],
         team_value_eur_m: dict[str, float],
         team_odds: dict[str, float] | None = None,
+        path_features: dict[str, dict[str, float]] | None = None,
     ) -> None:
+        """Set per-team static context for runtime feature construction."""
         self._team_elo = dict(team_elo)
         self._team_value = dict(team_value_eur_m)
         if team_odds is not None:
             self._team_odds = dict(team_odds)
+        if path_features is not None:
+            self._path_features = {t: dict(v) for t, v in path_features.items()}
 
     def _xgb_features_for(self, home_team: str, away_team: str, neutral: bool) -> pd.DataFrame:
         """Construct a single-row feature frame matching FEATURE_COLUMNS."""
@@ -754,8 +759,14 @@ class EnsemblePredictor:
             TEAM_CONFEDERATION,
             CONFEDERATION_DIFFICULTY,
             WC_KNOCKOUT_WIN_RATE,
+            PATH_FEATURE_KEYS,
             _value_tier,
         )
+
+        # Path-difficulty features are pre-computed per team once at
+        # set_context() time; here we just look them up.
+        ph = self._path_features.get(home_team, {k: 0.0 for k in PATH_FEATURE_KEYS})
+        pa = self._path_features.get(away_team, {k: 0.0 for k in PATH_FEATURE_KEYS})
 
         elo_h = self._team_elo.get(home_team, 1500.0)
         elo_a = self._team_elo.get(away_team, 1500.0)
@@ -815,6 +826,18 @@ class EnsemblePredictor:
             "odds_implied_prob_home": odds_p_h,
             "odds_implied_prob_away": odds_p_a,
             "odds_ratio": odds_ratio,
+            "group_avg_elo_opp_home": ph["group_avg_elo_opponents"],
+            "group_avg_elo_opp_away": pa["group_avg_elo_opponents"],
+            "group_max_elo_opp_home": ph["group_max_elo_opponent"],
+            "group_max_elo_opp_away": pa["group_max_elo_opponent"],
+            "group_elo_rank_home": ph["group_elo_rank"],
+            "group_elo_rank_away": pa["group_elo_rank"],
+            "bracket_half_home": ph["bracket_half"],
+            "bracket_half_away": pa["bracket_half"],
+            "expected_r16_opp_elo_home": ph["expected_r16_opponent_elo"],
+            "expected_r16_opp_elo_away": pa["expected_r16_opponent_elo"],
+            "path_to_final_avg_elo_home": ph["path_to_final_avg_elo"],
+            "path_to_final_avg_elo_away": pa["path_to_final_avg_elo"],
         }
         return pd.DataFrame([row])[FEATURE_COLUMNS]
 
@@ -823,10 +846,16 @@ class EnsemblePredictor:
         home_team: str,
         away_team: str,
         neutral: bool = True,
+        feature_row: "pd.DataFrame | None" = None,
     ) -> dict[str, float]:
+        """Blend the four heads. When evaluating historical fixtures pass the
+        matching ``feature_row`` from the training feat_df so XGB sees the
+        actual tournament's path-difficulty features, not the WC 2026 ones."""
         dc = self.dc.predict_outcome_probs(home_team, away_team, neutral=neutral)
         try:
-            X = self._xgb_features_for(home_team, away_team, neutral)
+            X = feature_row if feature_row is not None else self._xgb_features_for(home_team, away_team, neutral)
+            if hasattr(self.xgb, "feature_names_"):
+                X = X[self.xgb.feature_names_]
             proba = self.xgb.predict_proba(X)[0]  # [loss, draw, win] for home
             xgb_pred = {"home_win": float(proba[2]), "draw": float(proba[1]), "away_win": float(proba[0])}
         except Exception as exc:
