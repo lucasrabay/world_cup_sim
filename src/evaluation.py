@@ -26,9 +26,165 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, brier_score_loss, log_loss
 
-from .utils import MODELS_SAVED, get_logger
+from .utils import MODELS_SAVED, SIM_RESULTS, get_logger
 
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap confidence intervals
+# ---------------------------------------------------------------------------
+def bootstrap_metric_ci(
+    probs: np.ndarray,
+    outcomes: np.ndarray,
+    metric_fn: Callable[[np.ndarray, np.ndarray], float],
+    n_bootstrap: int = 5000,
+    confidence: float = 0.95,
+    rng: np.random.Generator | None = None,
+) -> dict:
+    """Percentile bootstrap CI for a probabilistic-prediction metric.
+
+    Both arrays must be aligned along axis 0. The metric function is called
+    once per bootstrap resample with the same (probs, outcomes) signature.
+
+    Parameters
+    ----------
+    probs : (n, 3) probability matrix [home, draw, away].
+    outcomes : (n, 3) one-hot or (n,) integer outcome vector — passed straight
+        through to ``metric_fn``.
+    metric_fn : callable that maps (probs, outcomes) → float.
+    n_bootstrap : number of resamples. 5000 is the practical sweet spot for a
+        2-decimal-stable percentile estimate.
+    confidence : two-sided coverage. 0.95 → 2.5/97.5 percentiles.
+    rng : optional numpy Generator.
+
+    Returns
+    -------
+    dict with keys ``point_estimate``, ``ci_low``, ``ci_high``, ``std``,
+    ``n_bootstrap``.
+    """
+    probs = np.asarray(probs)
+    outcomes = np.asarray(outcomes)
+    if probs.shape[0] != outcomes.shape[0]:
+        raise ValueError(
+            f"probs/outcomes axis-0 mismatch: {probs.shape[0]} vs {outcomes.shape[0]}"
+        )
+    if rng is None:
+        rng = np.random.default_rng(42)
+    n = probs.shape[0]
+    point = float(metric_fn(probs, outcomes))
+    if n == 0:
+        return {
+            "point_estimate": point, "ci_low": float("nan"), "ci_high": float("nan"),
+            "std": float("nan"), "n_bootstrap": int(n_bootstrap),
+        }
+    samples = np.empty(n_bootstrap, dtype=float)
+    for k in range(n_bootstrap):
+        idx = rng.integers(0, n, size=n)
+        samples[k] = float(metric_fn(probs[idx], outcomes[idx]))
+    alpha = 1.0 - confidence
+    lo = float(np.quantile(samples, alpha / 2.0))
+    hi = float(np.quantile(samples, 1.0 - alpha / 2.0))
+    return {
+        "point_estimate": point,
+        "ci_low": lo,
+        "ci_high": hi,
+        "std": float(samples.std(ddof=1)),
+        "n_bootstrap": int(n_bootstrap),
+    }
+
+
+def bootstrap_pairwise_brier_diff(
+    model_a_probs: np.ndarray,
+    model_b_probs: np.ndarray,
+    outcomes: np.ndarray,
+    n_bootstrap: int = 5000,
+    rng: np.random.Generator | None = None,
+) -> dict:
+    """Paired bootstrap on Brier(A) − Brier(B).
+
+    Critical: a single resampled index vector is applied to BOTH models, so
+    correlated errors don't inflate the diff variance the way an independent
+    two-sample bootstrap would.
+
+    Returns a dict with ``mean_diff`` (positive ⇒ A is worse), ``ci_low/high``
+    at 95% percentile, ``p_value_two_sided`` (frequency of bootstrap samples
+    whose sign opposes the mean), and ``significant_at_05``.
+    """
+    a = np.asarray(model_a_probs)
+    b = np.asarray(model_b_probs)
+    y = np.asarray(outcomes)
+    if a.shape != b.shape:
+        raise ValueError("model_a_probs and model_b_probs shapes must match")
+    if a.shape[0] != y.shape[0]:
+        raise ValueError("predictions/outcomes axis-0 mismatch")
+    if rng is None:
+        rng = np.random.default_rng(7)
+    n = a.shape[0]
+
+    def _brier(p: np.ndarray, oh: np.ndarray) -> float:
+        return _multiclass_brier(p, oh)
+
+    point_diff = _brier(a, y) - _brier(b, y)
+    diffs = np.empty(n_bootstrap, dtype=float)
+    for k in range(n_bootstrap):
+        idx = rng.integers(0, n, size=n)  # paired resample
+        diffs[k] = _brier(a[idx], y[idx]) - _brier(b[idx], y[idx])
+    lo = float(np.quantile(diffs, 0.025))
+    hi = float(np.quantile(diffs, 0.975))
+    # Two-sided p-value: fraction of resamples whose sign disagrees with the
+    # observed mean direction. Doubled is conservative for unimodal diffs.
+    if point_diff >= 0:
+        opp = float((diffs <= 0).mean())
+    else:
+        opp = float((diffs >= 0).mean())
+    p_two = float(min(1.0, 2.0 * opp))
+    return {
+        "mean_diff": float(point_diff),
+        "ci_low": lo,
+        "ci_high": hi,
+        "p_value_two_sided": p_two,
+        "significant_at_05": bool(p_two < 0.05),
+        "n_bootstrap": int(n_bootstrap),
+    }
+
+
+# Metric callable adapters that accept (probs, outcomes_oh) signatures so
+# they can be plugged into ``bootstrap_metric_ci``.
+def _metric_brier(probs: np.ndarray, oh: np.ndarray) -> float:
+    return _multiclass_brier(probs, oh)
+
+
+def _metric_rps(probs: np.ndarray, oh: np.ndarray) -> float:
+    return ranked_probability_score(probs, oh)
+
+
+def _metric_logloss(probs: np.ndarray, oh: np.ndarray) -> float:
+    """Sklearn log-loss but accepting one-hot outcomes for paired bootstrap."""
+    int_y = np.argmax(oh, axis=1)
+    # oh column order is [home, draw, away]; map back to outcome encoding
+    #   [away=0, draw=1, home=2] used elsewhere in the codebase.
+    out = np.where(int_y == 0, 2, np.where(int_y == 1, 1, 0))
+    return float(log_loss(out, probs[:, [2, 1, 0]], labels=[0, 1, 2]))
+
+
+def _metric_accuracy(probs: np.ndarray, oh: np.ndarray) -> float:
+    pred = probs.argmax(axis=1)
+    truth = oh.argmax(axis=1)
+    return float((pred == truth).mean())
+
+
+def _metric_calerr(probs: np.ndarray, oh: np.ndarray) -> float:
+    return _calibration_error(probs, oh)
+
+
+METRIC_FUNCTIONS: dict[str, Callable[[np.ndarray, np.ndarray], float]] = {
+    "brier": _metric_brier,
+    "rps": _metric_rps,
+    "log_loss": _metric_logloss,
+    "accuracy": _metric_accuracy,
+    "calibration_error": _metric_calerr,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +502,89 @@ class ModelEvaluator:
         self._last_matches = matches
         return df
 
+    def bootstrap_all_metrics(
+        self,
+        n_bootstrap: int = 5000,
+        rng: np.random.Generator | None = None,
+        metrics: Iterable[str] | None = None,
+    ) -> pd.DataFrame:
+        """Long-form bootstrap CI table for every (model, metric) cell.
+
+        Must be called after :meth:`evaluate_all` so cached probs are available.
+        Returns a frame with columns ``model``, ``metric``, ``point_estimate``,
+        ``ci_low``, ``ci_high``, ``std`` — suitable for direct CSV export and
+        for joining into the print-side comparison table.
+        """
+        if not hasattr(self, "_last_probs") or not self._last_probs:
+            raise RuntimeError("Call evaluate_all() before bootstrap_all_metrics()")
+        if rng is None:
+            rng = np.random.default_rng(2026)
+        outcomes_oh = self._one_hot(self._last_matches["outcome"].astype(int).to_numpy())
+        if metrics is None:
+            metrics = ("brier", "log_loss", "accuracy", "rps", "calibration_error")
+        rows: list[dict] = []
+        for model_name, probs in self._last_probs.items():
+            for metric in metrics:
+                fn = METRIC_FUNCTIONS[metric]
+                ci = bootstrap_metric_ci(
+                    probs, outcomes_oh, fn,
+                    n_bootstrap=n_bootstrap, rng=rng,
+                )
+                rows.append({
+                    "model": model_name,
+                    "metric": metric,
+                    "point_estimate": ci["point_estimate"],
+                    "ci_low": ci["ci_low"],
+                    "ci_high": ci["ci_high"],
+                    "std": ci["std"],
+                })
+        return pd.DataFrame(rows)
+
+    def pairwise_brier_vs(
+        self,
+        reference: str,
+        n_bootstrap: int = 5000,
+        rng: np.random.Generator | None = None,
+    ) -> pd.DataFrame:
+        """Paired bootstrap Brier comparisons against ``reference`` model.
+
+        Returns one row per OTHER model with ``mean_diff`` (other − reference,
+        so a negative diff means the other model is BETTER than the reference)
+        plus the 95% CI and two-sided p-value.
+
+        Note on sign convention: ``bootstrap_pairwise_brier_diff(A, B)`` returns
+        Brier(A) − Brier(B), so by passing the reference as A and the other
+        model as B we flip the sign. We instead pass (other, reference) and
+        report the result directly — negative mean_diff means the OTHER model
+        beats the reference on Brier.
+        """
+        if not hasattr(self, "_last_probs") or not self._last_probs:
+            raise RuntimeError("Call evaluate_all() before pairwise_brier_vs()")
+        if reference not in self._last_probs:
+            raise KeyError(f"reference model '{reference}' not in cached evaluation")
+        if rng is None:
+            rng = np.random.default_rng(2027)
+        ref_probs = self._last_probs[reference]
+        outcomes_oh = self._one_hot(self._last_matches["outcome"].astype(int).to_numpy())
+        rows: list[dict] = []
+        for name, probs in self._last_probs.items():
+            if name == reference:
+                continue
+            res = bootstrap_pairwise_brier_diff(
+                probs, ref_probs, outcomes_oh,
+                n_bootstrap=n_bootstrap, rng=rng,
+            )
+            rows.append({
+                "model": name,
+                "vs": reference,
+                "mean_diff": res["mean_diff"],
+                "ci_low": res["ci_low"],
+                "ci_high": res["ci_high"],
+                "p_value": res["p_value_two_sided"],
+                "significant_at_05": res["significant_at_05"],
+            })
+        return pd.DataFrame(rows)
+
     def evaluate_split(
         self,
         models: Mapping[str, object],
@@ -409,6 +648,9 @@ class ModelEvaluator:
 __all__ = [
     "ranked_probability_score",
     "calibration_curve_multi",
+    "bootstrap_metric_ci",
+    "bootstrap_pairwise_brier_diff",
+    "METRIC_FUNCTIONS",
     "ModelEvaluator",
     "_UniformBaseline",
     "_HomeWinBaseline",

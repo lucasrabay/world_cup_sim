@@ -7,12 +7,15 @@ import pytest
 
 from src.data_loader import FALLBACK_ELO, SQUAD_VALUES, WC2026_GROUPS
 from src.evaluation import (
+    METRIC_FUNCTIONS,
     ModelEvaluator,
     _DCAdapter,
     _ELOLogisticAdapter,
     _HomeWinBaseline,
     _UniformBaseline,
     _XGBFeatureAdapter,
+    bootstrap_metric_ci,
+    bootstrap_pairwise_brier_diff,
     ranked_probability_score,
 )
 from src.features import (
@@ -192,6 +195,100 @@ def test_ensemble_beats_random(small_evaluator):
     assert ens_brier < 0.280, f"Ensemble Brier should beat random comfortably; got {ens_brier:.4f}"
 
 
+# ---------------------------------------------------------------------------
+# Bootstrap CI tests (Task 5 Part A)
+# ---------------------------------------------------------------------------
+def _synthetic_probs_outcomes(n: int, seed: int = 0):
+    """Generate (n,3) probs and (n,3) one-hot outcomes with a known correlation
+    between model confidence and the realised class. Used to exercise the
+    bootstrap routines without needing the full training pipeline."""
+    rng = np.random.default_rng(seed)
+    # Sample "true" outcomes with class probs roughly [0.45, 0.27, 0.28].
+    truth = rng.choice([0, 1, 2], size=n, p=[0.45, 0.27, 0.28])
+    oh = np.zeros((n, 3), dtype=float)
+    oh[np.arange(n), truth] = 1.0
+    # Smoothed probabilities that favour the truth, so the model has positive skill.
+    base = np.full((n, 3), 1.0 / 3.0)
+    base[np.arange(n), truth] += rng.uniform(0.1, 0.4, size=n)
+    base /= base.sum(axis=1, keepdims=True)
+    return base, oh
+
+
+def test_bootstrap_ci_contains_point_estimate():
+    """The point estimate is just the metric on the original sample; with
+    enough bootstrap samples the 95% percentile interval is overwhelmingly
+    likely to bracket it (>99% of the time for a typical metric)."""
+    probs, oh = _synthetic_probs_outcomes(120, seed=11)
+    res = bootstrap_metric_ci(
+        probs, oh, METRIC_FUNCTIONS["brier"],
+        n_bootstrap=1000, rng=np.random.default_rng(0),
+    )
+    pe = res["point_estimate"]
+    assert res["ci_low"] <= pe <= res["ci_high"], (
+        f"Point estimate {pe} outside CI [{res['ci_low']}, {res['ci_high']}]"
+    )
+
+
+def test_bootstrap_paired_is_paired():
+    """Two highly-correlated predictors should produce a narrower paired-diff
+    interval than two independent predictors with the same marginal variance.
+
+    Build model A and model B = A + small independent noise.  The paired
+    bootstrap should report a tight CI on the diff.  An IID two-sample
+    bootstrap (sampling A and B from independent indices) would see a much
+    wider interval because the correlated component cancels.
+    """
+    rng = np.random.default_rng(3)
+    probs_a, oh = _synthetic_probs_outcomes(200, seed=21)
+    noise = rng.uniform(-0.02, 0.02, size=probs_a.shape)
+    probs_b = np.clip(probs_a + noise, 1e-6, None)
+    probs_b /= probs_b.sum(axis=1, keepdims=True)
+
+    paired = bootstrap_pairwise_brier_diff(
+        probs_a, probs_b, oh, n_bootstrap=1500, rng=np.random.default_rng(0),
+    )
+    paired_width = paired["ci_high"] - paired["ci_low"]
+
+    # Independent two-sample baseline: shuffle B's indices so the (A_i, B_i)
+    # pairing is destroyed within each resample.
+    def _brier(p, o):
+        return ((p - o) ** 2).mean(axis=1).mean()
+    rng2 = np.random.default_rng(0)
+    diffs = []
+    n = probs_a.shape[0]
+    for _ in range(1500):
+        idx_a = rng2.integers(0, n, size=n)
+        idx_b = rng2.integers(0, n, size=n)  # independent sampler
+        d = _brier(probs_a[idx_a], oh[idx_a]) - _brier(probs_b[idx_b], oh[idx_b])
+        diffs.append(d)
+    indep = np.array(diffs)
+    indep_width = float(np.quantile(indep, 0.975) - np.quantile(indep, 0.025))
+
+    assert paired_width < indep_width, (
+        f"Paired CI ({paired_width:.4f}) should be tighter than independent "
+        f"two-sample CI ({indep_width:.4f})"
+    )
+
+
+def test_bootstrap_ci_shrinks_with_more_samples():
+    """Increasing the bootstrap count shouldn't widen the CI (modulo a small
+    Monte-Carlo wobble). 10× more samples must produce a CI no wider than a
+    small tolerance relative to the lower-resolution version."""
+    probs, oh = _synthetic_probs_outcomes(150, seed=42)
+    rng = np.random.default_rng(0)
+    narrow = bootstrap_metric_ci(probs, oh, METRIC_FUNCTIONS["brier"], n_bootstrap=10_000, rng=rng)
+    rng = np.random.default_rng(0)
+    wide = bootstrap_metric_ci(probs, oh, METRIC_FUNCTIONS["brier"], n_bootstrap=1_000, rng=rng)
+    w_narrow = narrow["ci_high"] - narrow["ci_low"]
+    w_wide = wide["ci_high"] - wide["ci_low"]
+    # Allow a small slack: percentile estimates from 10 000 draws are stabler
+    # but on rare tails can land slightly above the 1 000-draw width.
+    assert w_narrow <= w_wide + 0.02, (
+        f"10k-sample CI ({w_narrow:.4f}) wider than 1k-sample CI ({w_wide:.4f})"
+    )
+
+
+# ---------------------------------------------------------------------------
 def test_calibration_after_isotonic(small_evaluator):
     """Calibrated XGB should have no worse calibration than uncalibrated."""
     ens = small_evaluator["ensemble"]

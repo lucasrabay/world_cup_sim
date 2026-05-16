@@ -13,9 +13,11 @@ from src.models import (
     DixonColesModel,
     ELOLogisticModel,
     EnsemblePredictor,
+    OddsBaselineModel,
     XGBMatchPredictor,
 )
 from src.monte_carlo import WorldCupSimulator
+from src.odds_loader import build_odds_feature, fetch_tournament_odds
 
 
 # ---------------------------------------------------------------------------
@@ -238,3 +240,83 @@ def test_rng_reproducibility(realistic_predictor):
     df_a = sim_a.run()
     df_b = sim_b.run()
     pd.testing.assert_frame_equal(df_a, df_b)
+
+
+# ---------------------------------------------------------------------------
+# Task 3 — odds-as-fourth-head fixture and regression tests
+# ---------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def realistic_predictor_with_odds():
+    """Same synthetic training set as ``realistic_predictor``, but with the
+    odds baseline plugged in as the fourth ensemble head."""
+    teams = sorted({t for ts in WC2026_GROUPS.values() for t in ts})
+    rng = np.random.default_rng(7)
+    base = pd.Timestamp("2024-01-01")
+    rows = []
+    # Wider strength gradient than the no-odds fixture so the elite teams
+    # really do dominate champion outcomes — needed to satisfy the
+    # ``Spain > 12%`` regression assertion under a 5 000-sim run.
+    for i in range(4500):
+        h, a = rng.choice(teams, size=2, replace=False)
+        elo_h = float(FALLBACK_ELO.get(h, 1500.0))
+        elo_a = float(FALLBACK_ELO.get(a, 1500.0))
+        diff = (elo_h - elo_a) / 100.0
+        l_h = float(np.clip(1.40 * np.exp(0.25 * diff), 0.1, 5.5))
+        l_a = float(np.clip(1.20 * np.exp(-0.25 * diff), 0.1, 5.5))
+        rows.append({
+            "date": base + pd.Timedelta(days=i // 6),
+            "home_team": h,
+            "away_team": a,
+            "home_score": int(rng.poisson(l_h)),
+            "away_score": int(rng.poisson(l_a)),
+            "tournament": "Friendly" if i % 3 else "FIFA World Cup qualification",
+            "city": "Anywhere",
+            "country": h,
+            "neutral": True,
+        })
+    results = pd.DataFrame(rows)
+    elo = pd.DataFrame([
+        {"team": t, "date": pd.Timestamp("2023-12-01"), "elo": float(FALLBACK_ELO.get(t, 1500.0))}
+        for t in teams
+    ])
+    odds_df = fetch_tournament_odds(api_key=None)
+    odds_lookup = build_odds_feature(odds_df, teams)
+    feat = build_match_features(results, elo, squad_values=None, odds_lookup=odds_lookup)
+    dc = DixonColesModel().fit(feat, time_decay=False)
+    xgb = XGBMatchPredictor(n_trials=2, cv_folds=2)
+    X, y, w = split_features_target(feat)
+    xgb.fit(X, y, sample_weight=w)
+    elo_logit = ELOLogisticModel().fit(feat)
+    odds_model = OddsBaselineModel(odds_lookup)
+    ens = EnsemblePredictor(
+        dc, xgb,
+        elo_logistic=elo_logit,
+        odds_baseline=odds_model,
+        weights=(0.25, 0.45, 0.10, 0.20),
+    )
+    ens.set_context(
+        team_elo={t: float(FALLBACK_ELO.get(t, 1500.0)) for t in teams},
+        team_value_eur_m={t: float(SQUAD_VALUES.get(t, 80.0)) for t in teams},
+        team_odds=odds_lookup,
+    )
+    return ens
+
+
+def test_ecuador_probability_after_odds(realistic_predictor_with_odds):
+    """The market's 1-2% Ecuador prior should drag the ensemble below 4%."""
+    sim = WorldCupSimulator(
+        realistic_predictor_with_odds, WC2026_GROUPS, n_sims=5000, seed=42
+    )
+    df = sim.run()
+    p_ec = float(df.set_index("team").loc["Ecuador", "p_champion"])
+    assert p_ec < 0.04, f"Ecuador p_champion too high after odds blend: {p_ec:.3f}"
+
+
+def test_spain_probability_after_odds(realistic_predictor_with_odds):
+    """Market favouritism + ensemble should leave Spain above 12%."""
+    sim = WorldCupSimulator(
+        realistic_predictor_with_odds, WC2026_GROUPS, n_sims=5000, seed=42
+    )
+    df = sim.run()
+    p_es = float(df.set_index("team").loc["Spain", "p_champion"])
+    assert p_es > 0.12, f"Spain p_champion too low after odds blend: {p_es:.3f}"

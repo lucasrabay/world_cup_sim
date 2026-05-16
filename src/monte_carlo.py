@@ -110,8 +110,21 @@ class WorldCupSimulator:
         self._fixture_cache: dict[tuple[str, str, str], dict] = {}
         # Lightweight backwards-compat λ cache (some external callers expect it).
         self._lambda_cache: dict[tuple[str, str], tuple[float, float]] = {}
+        # Pre-played (live tournament) results. Each entry: (home, away) ->
+        # (goals_home, goals_away). Populated by run() from its fixed_results
+        # parameter; left empty for ordinary baseline / scenario runs.
+        self._fixed_lookup: dict[tuple[str, str], tuple[int, int]] = {}
 
     # ------------------------------------------------------------------ utils
+    @staticmethod
+    def _scenario_touches(a: str, b: str, scenario: dict) -> bool:
+        """True if the scenario modifies team ``a`` or ``b`` in any way."""
+        for fld in ("lambda_mult", "attack_mult", "defence_mult", "elo_delta"):
+            d = scenario.get(fld)
+            if d and (a in d or b in d):
+                return True
+        return False
+
     @staticmethod
     def _scenario_key(scenario: dict | None) -> str:
         """Stable hashable identifier for a scenario dict."""
@@ -155,7 +168,16 @@ class WorldCupSimulator:
         return out[0], out[1], out[2]
 
     def _lambda(self, a: str, b: str, scenario: dict | None = None) -> tuple[float, float]:
-        """Backwards-compat: just the λ pair (with scenario applied + clipped)."""
+        """Backwards-compat: just the λ pair (with scenario applied + clipped).
+
+        Scenario fields honoured (all optional, dict by team name):
+            * ``lambda_mult``  — pure attack-side multiplier (legacy).
+            * ``attack_mult``  — same as lambda_mult; used by the live scenario
+              builder for clarity.
+            * ``defence_mult`` — defensive strength; divides the OPPONENT's λ.
+            * ``elo_delta``    — folded into a multiplicative shift on the
+              team's effective attack & defence (rule of thumb: ±400 ELO ≈ ×e).
+        """
         key = (a, b)
         if key in self._lambda_cache:
             la, lb = self._lambda_cache[key]
@@ -166,8 +188,22 @@ class WorldCupSimulator:
                 la, lb = 1.2, 1.2
             self._lambda_cache[key] = (la, lb)
         if scenario:
-            la *= scenario.get("lambda_mult", {}).get(a, 1.0)
-            lb *= scenario.get("lambda_mult", {}).get(b, 1.0)
+            lam_mult = scenario.get("lambda_mult", {})
+            att_mult = scenario.get("attack_mult", {})
+            def_mult = scenario.get("defence_mult", {})
+            elo_d = scenario.get("elo_delta", {})
+
+            am_a = float(lam_mult.get(a, 1.0)) * float(att_mult.get(a, 1.0))
+            am_b = float(lam_mult.get(b, 1.0)) * float(att_mult.get(b, 1.0))
+            dm_a = max(float(def_mult.get(a, 1.0)), 1e-6)
+            dm_b = max(float(def_mult.get(b, 1.0)), 1e-6)
+            es_a = float(np.exp(float(elo_d.get(a, 0.0)) / 400.0))
+            es_b = float(np.exp(float(elo_d.get(b, 0.0)) / 400.0))
+
+            # λ_A grows with A's offence and shrinks with B's defence; ELO
+            # delta acts as a symmetric overall-strength shift on each side.
+            la = la * am_a * es_a / (dm_b * es_b)
+            lb = lb * am_b * es_b / (dm_a * es_a)
         return float(np.clip(la, 0.05, 6.0)), float(np.clip(lb, 0.05, 6.0))
 
     def _prebuild_baseline_cache(self) -> None:
@@ -266,11 +302,22 @@ class WorldCupSimulator:
         we re-derive outcomes from the τ-corrected DC grid at the adjusted λs
         — this is the only way an injury / form scenario can move outcomes,
         since the ensemble's XGB head doesn't see scenario flags.
+
+        Fast path: if the scenario doesn't touch either ``a`` or ``b``, the
+        baseline cache (built once per simulator) gives us the same answer.
+        This cuts run_scenario_live runtime almost in half when only a couple
+        of teams are modified.
         """
         key = (a, b, self._scenario_key(scenario))
         cached = self._fixture_cache.get(key)
         if cached is not None:
             return cached
+
+        if scenario is not None and not self._scenario_touches(a, b, scenario):
+            base = self._fixture_cache.get((a, b, "_baseline_"))
+            if base is not None:
+                self._fixture_cache[key] = base
+                return base
 
         rho = float(self.predictor.dc.rho)
 
@@ -629,7 +676,16 @@ class WorldCupSimulator:
             fixture_results: list[tuple[int, int, np.ndarray, np.ndarray]] = []
 
             for i, j in fixtures:
-                ga, gb = self._sample_scorelines(members[i], members[j], n=n, scenario=scenario)
+                fixed = self._fixed_lookup.get((members[i], members[j])) if self._fixed_lookup else None
+                if fixed is None and self._fixed_lookup:
+                    rev = self._fixed_lookup.get((members[j], members[i]))
+                    if rev is not None:
+                        fixed = (rev[1], rev[0])  # swap goals to (gh, ga) ordering
+                if fixed is not None:
+                    ga = np.full(n, int(fixed[0]), dtype=np.int32)
+                    gb = np.full(n, int(fixed[1]), dtype=np.int32)
+                else:
+                    ga, gb = self._sample_scorelines(members[i], members[j], n=n, scenario=scenario)
                 # Update points / gd / gf
                 home_win = ga > gb
                 draw = ga == gb
@@ -939,14 +995,33 @@ class WorldCupSimulator:
         return champions
 
     # ------------------------------------------------------------------ orchestrator
-    def run(self, scenario: dict | None = None) -> pd.DataFrame:
-        """Run the full simulation and return the per-team summary frame."""
+    def run(
+        self,
+        scenario: dict | None = None,
+        fixed_results: list[dict] | None = None,
+    ) -> pd.DataFrame:
+        """Run the full simulation and return the per-team summary frame.
+
+        Parameters
+        ----------
+        scenario : optional scenario dict with ``lambda_mult`` / ``attack_mult`` /
+            ``defence_mult`` / ``elo_delta`` overrides.
+        fixed_results : optional list of dicts ``{'home', 'away', 'goals_home',
+            'goals_away'}`` that pin specific group-stage fixtures to their
+            actual outcomes. Pinned matches are not simulated.
+        """
         # reset RNG so that independent .run() calls with same seed are deterministic
         self._rng = np.random.default_rng(self.seed)
         # Drop any per-fixture cache state from a previous scenario; otherwise
         # a baseline run could re-use grids built under, say, "haaland_injured".
         self._fixture_cache = {}
         self._lambda_cache = {}
+        # Pin already-played fixtures so the group stage uses real results.
+        self._fixed_lookup = {}
+        if fixed_results:
+            for r in fixed_results:
+                h = str(r["home"]); a = str(r["away"])
+                self._fixed_lookup[(h, a)] = (int(r["goals_home"]), int(r["goals_away"]))
         # Batched ensemble pre-prediction — one XGB call for every pair so the
         # inner loop is pure NumPy. Only worthwhile for baseline; scenarios
         # use DC-derived probs and need re-keyed cache entries anyway.
@@ -1032,6 +1107,71 @@ class WorldCupSimulator:
             # underdog is B
             return float(probs["away_win"])
         return float(probs["home_win"])
+
+    def _ensure_baseline_cache(self) -> None:
+        """Public helper so the live-scenario path can warm the baseline cache
+        and benefit from the unaffected-pair fast path inside ``_fixture_data``."""
+        if not any(k for k in self._fixture_cache if k[2] == "_baseline_"):
+            self._prebuild_baseline_cache()
+
+    def run_scenario_live(
+        self,
+        modifications: list[dict],
+        n_sims: int = 5000,
+    ) -> pd.DataFrame:
+        """Fast scenario sim driven by interactive team modifications.
+
+        Each modification dict has the shape::
+
+            {"team": str, "elo_delta": float, "attack_mult": float, "def_mult": float}
+
+        The function temporarily reduces ``n_sims`` for speed, builds the
+        scenario dict, runs the simulator, and restores the original sim count
+        before returning the summary frame.
+        """
+        scenario = {"name": "live_scenario"}
+        for m in modifications:
+            team = str(m["team"])
+            scenario.setdefault("elo_delta", {})[team] = float(m.get("elo_delta", 0.0) or 0.0)
+            scenario.setdefault("attack_mult", {})[team] = float(m.get("attack_mult", 1.0) or 1.0)
+            scenario.setdefault("defence_mult", {})[team] = float(m.get("def_mult", 1.0) or 1.0)
+        original = self.n_sims
+        try:
+            self.n_sims = int(n_sims)
+            # Warm the baseline fixture cache once; subsequent scenarios reuse
+            # the unaffected-pair grids and only rebuild the modified ones.
+            had_baseline = any(k for k in self._fixture_cache if k[2] == "_baseline_")
+            if not had_baseline:
+                self._prebuild_baseline_cache()
+            return self._run_scenario_reuse_baseline(scenario)
+        finally:
+            self.n_sims = original
+
+    def _run_scenario_reuse_baseline(self, scenario: dict) -> pd.DataFrame:
+        """Variant of :meth:`run` that does NOT wipe the baseline fixture cache.
+
+        Used by :meth:`run_scenario_live` so unaffected pairs can short-circuit
+        to the baseline grid built earlier.
+        """
+        self._rng = np.random.default_rng(self.seed)
+        self._fixed_lookup = {}
+        # Drop only scenario-specific cache entries; keep baseline entries.
+        self._fixture_cache = {
+            k: v for k, v in self._fixture_cache.items() if k[2] == "_baseline_"
+        }
+        ctx = SimContext(teams=list(self.teams), n_sims=self.n_sims)
+        placements_idx, group_letters, group_metrics = self.simulate_group_stage(
+            scenario=scenario, ctx=ctx,
+        )
+        ctx.exit_round[:] = self.ROUND_RANK[ROUND_GROUP]
+        best_thirds = self.get_best_third_places(group_metrics)
+        rows = np.arange(self.n_sims)[:, None]
+        for g in group_letters:
+            adv = placements_idx[g][:, :2]
+            ctx.exit_round[rows, adv] = self.ROUND_RANK[ROUND_R32]
+        ctx.exit_round[rows, best_thirds] = self.ROUND_RANK[ROUND_R32]
+        self.simulate_knockout_bracket(placements_idx, best_thirds, ctx, scenario=scenario)
+        return self._summarise(ctx)
 
     def run_scenarios(self, scenarios: list[dict] | None = None) -> dict[str, pd.DataFrame]:
         """Run a default panel of scenarios (or a user-supplied list)."""
